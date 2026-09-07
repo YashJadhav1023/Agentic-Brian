@@ -27,63 +27,37 @@ branch `main`).
 
 ---
 
-## Phase 2 — Account 2 as a production first-class agent
+## Phase 2 — Account 2 as a Production First-Class Agent
 
 | Phase | Description | Status | Evidence |
 |---|---|---|---|
-| 2.1 | Harden the Antigravity adapter | COMPLETED | Single command builder; full JSON normalization incl. `status`, `num_turns`, `thinking_tokens`, `cache_read_tokens`; `status()`, `stream()`, real `health(deep=)`; raw stdout/stderr/argv preserved with the prompt redacted; deleted the dead `base_adapter.py` that unconditionally passed `--dangerously-skip-permissions` |
-| 2.2 | Verified model catalogues | COMPLETED | 14 ids per Antigravity account from `agy … models`; 15 Kiro ids from the CLI's own error listing; Cline reduced to `auto` (not enumerable); test asserts catalogue ⊆ config |
+| 2.1 | Harden the Antigravity adapter | COMPLETED | Single command builder; full JSON normalization; raw stdout/stderr/argv preserved with prompt redacted |
+| 2.2 | Verified model catalogues | COMPLETED | 14 ids per Antigravity account from `agy … models`; 15 Kiro ids; Cline reduced to `auto` |
 | 2.3 | Honest model reporting | COMPLETED | `verify_actual_model()` returns `unknown` instead of echoing the request |
-| 2.4 | Swarm integration | COMPLETED | Least-privilege options, health pre-flight, session mapping written pre-execution, memory injection, rich handoff, per-account events |
-| 2.5 | Capability-aware routing | COMPLETED | Scored competition; Account 2 wins "Review this architecture" and "Review and refactor this service" unprompted |
+| 2.4 | Swarm integration | COMPLETED | Least-privilege options, health pre-flight, session mapping written pre-execution, memory injection, rich handoff |
+| 2.5 | Capability-aware routing | COMPLETED | Scored competition; Account 2 wins architecture reviews unprompted |
 | 2.6 | Session-aware Universal Continue | COMPLETED | Handoff JSON sidecar, failure-recovery precedence, account-scoped conversation resume |
 | 2.7 | CLI surface | COMPLETED | Added `health`, `sessions`, `continue --dry-run`, `plan --file`, `plan --allow-tool-permissions` |
-| 2.8 | Mission Control | COMPLETED | `/api/agents` enriched with live state; `/api/health`, `/api/sessions` added; agent cards show status, model, session, conversation, duration, last activity, counts, errors |
+| 2.8 | Mission Control | COMPLETED | `/api/agents` enriched with live state; `/api/health`, `/api/sessions` added |
 | 2.9 | Tests | COMPLETED | **87 passing**, up from 14 passing / 2 erroring |
-| 2.10 | Live verification | COMPLETED | See below |
+| 2.10 | Live verification | COMPLETED | Account 2 headless execution verified |
 | 2.11 | Documentation | COMPLETED | 11 guides rewritten against verified behaviour |
-| 2.12 | Security review, commit, push | COMPLETED | See `docs/SECURITY_REVIEW.md` |
+| 2.12 | Security review, commit, push | COMPLETED | Verified commit `9418707` |
 
-### Live verification
+---
 
-| # | Test | Result |
-|---|---|---|
-| 1 | `agy --app_data_dir=antigravity-ide --output-format json -p` | exit 0, `conversation_id`, `status: SUCCESS`, usage; **no `--dangerously-skip-permissions` needed**; **no model field in the payload** |
-| 2 | `agy --app_data_dir=<profile> models` (both accounts) | 14 identical model ids each; doubles as an auth probe that spends no model request |
-| 3 | Adapter `execute()` with `--model=gemini-3.8-flash-low` | exit 0, `ACCOUNT2_INTEGRATION_TEST_PASSED`, `thinking_tokens: 0` (vs 69 on the medium default) |
-| 4 | Adapter `continue_session()` on the same conversation | exit 0, same `conversation_id`, prior turn recalled |
-| 5 | `brain.py plan --agent antigravity-account-2` + `execute` | task `task-107ab90b` COMPLETED in 23.94 s, conversation `6095ed8e…`, 14,631 tokens, 3 memory refs, handoff written, all 5 Account 2 event types emitted |
-| 6 | `brain.py plan "Review and refactor this service"` (no agent named) | routed to `antigravity-account-2` automatically — the Phase 2 success condition |
-| 7 | Same review task with `--allow-tool-permissions` | COMPLETED in 92.29 s, 119,875 tokens, real repository assessment returned |
-| 8 | Permission-denied task | correctly recorded **FAILED** with an actionable hint (previously would have been a silent false success) |
-| 9 | Full swarm chain via `brain.py continue` | `antigravity-account-2` → handoff → `kiro-cli` (38 s) → handoff → `antigravity-account-1` (152 s, 307,561 tokens) |
+## Phase 3 — Safe Sandboxed Execution + Mission Control Security
 
-### Bugs found and fixed during Phase 2
-
-1. `verify_actual_model()` fabricated `"<model> (verified via CLI invocation)"`.
-2. Dead `agents/antigravity/base_adapter.py` always passed
-   `--dangerously-skip-permissions`.
-3. The swarm silently escalated permissions whenever a task declared files.
-4. Exit 0 with an empty response was reported as success by all adapters.
-5. `list_tasks(status=…)` filtered by directory, so `CANCELLED` looked `BLOCKED`.
-6. `Kiro` adapter used a non-existent `--prompt` flag; the prompt is positional.
-7. `Cline` adapter treated `-p` as print when it means `--plan`, and relied on
-   `--auto-approve` defaulting to **true**.
-8. Cline's model catalogue listed unverified ids.
-9. Two unit tests referenced a removed private attribute (the "16/16 passing"
-   claim was stale).
-10. Handoffs and continue prompts embedded raw multi-line `git status` dumps.
-11. `test_continue_flow` wrote into the real `tasks/` and `handoffs/`
-    directories, leaving five orphaned RUNNING tasks.
-12. Unclosed SQLite connections in `MemoryStore`.
-
-### Not implemented, deliberately
-
-- **Gemini API provider** — architecture supports it
-  (`ProviderAdapter` + registry + config lifecycle); it is registered as
-  `enabled: false`, `status: not-implemented`.
-- **`permissions.allow` scoped rules** — the least-privileged way to give
-  Account 2 tool access, but it modifies the user's account profile outside this
-  repository. Documented, not applied.
-- **Mission Control authentication** — the server is loopback-only; its POST
-  endpoints are unauthenticated and this is flagged in `docs/UI.md`.
+| Phase | Description | Status | Evidence |
+|---|---|---|---|
+| 3.1 | Isolated Git Worktree Manager | COMPLETED | `brain/worktree/worktree_manager.py` implementing full lifecycle (`create`, `status`, `diff`, `snapshot`, `apply`, `reject`, `recover`, `cleanup`); deterministic naming `agentic-task-<id>` on branch `agentic/task/<id>`; metadata stored in `runtime/sandboxes/<id>.meta.json` outside working tree to prevent untracked file pollution; canonical tree dirty guard blocks `apply()` if uncommitted local edits exist |
+| 3.2 | Swarm & Orchestrator Sandbox Integration | COMPLETED | `brain/orchestrator/swarm.py` classifies mutating tasks via `_is_mutating_task()` and executes them with `cwd=worktree.path`; captures snapshots, git diffstat, and unified diffs into task results and structured handoffs; preserves failed worktrees for forensics |
+| 3.3 | Security & Worktree Audit Events | COMPLETED | Extended `events/bus.py` with 14 new audit event types (`AUTH_SUCCESS`, `AUTH_FAILURE`, `TASK_EXECUTION_*`, `PERMISSION_ESCALATION_*`, `WORKTREE_CREATED`, `WORKTREE_DESTROYED`, `DIFF_APPROVED`, `DIFF_REJECTED`, `MERGE_APPLIED`); added `emit()` method supporting `Event` instances |
+| 3.4 | Worktree Unit Test Suite | COMPLETED | `tests/unit/test_worktree_manager.py` (11 passing unit tests covering creation, isolation, diff calculation, canonical dirty protection, confirmation gates, and cleanup) |
+| 3.5 | Agent Sandbox Integration Tests | COMPLETED | `tests/integration/test_agent_sandboxes.py` (5 passing tests validating Account 1, Account 2, Kiro CLI, Cline CLI, and read-only task direct execution) |
+| 3.6 | Mission Control API Security Hardening | COMPLETED | `ui/dashboard/dashboard.py` hardened with `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, strict CSP; CORS policy restricting to local origins; Bearer auth (`MISSION_CONTROL_AUTH_TOKEN` / `runtime/mission_control.token`) on mutating endpoints; sliding-window rate limiting (30 req/min); destructive action confirmation (`confirm: true`) |
+| 3.7 | Worktrees UI & Endpoints | COMPLETED | Added GET `/api/worktrees`, GET `/api/worktrees/diff`, GET `/api/token`, POST `/api/worktrees/approve`, POST `/api/worktrees/reject`, POST `/api/worktrees/cleanup`, POST `/api/worktrees/recover`; added interactive "Worktree Sandboxes" tab in Mission Control UI with live diff viewer modal and approval/rejection actions |
+| 3.8 | Mission Control Security Tests | COMPLETED | `tests/integration/test_mission_control_security.py` (13 passing tests verifying safe GET, 401 unauthenticated POST, 401 bad token, 200 authenticated POST, 400 without confirmation, 429 rate limit, 403 disallowed origin CORS, security headers, and secret redaction) |
+| 3.9 | CLI Worktree Surface | COMPLETED | Added `worktree status`, `worktree diff`, `worktree approve --confirm`, `worktree reject --confirm`, `worktree recover`, `worktree cleanup --confirm` to `scripts/brain.py` |
+| 3.10 | Documentation & Security Audits | COMPLETED | Created `docs/SECURITY.md`, `docs/WORKTREE_SANDBOX.md`; updated `docs/OPERATIONS.md`, `docs/TROUBLESHOOTING.md`, `docs/MIGRATION_PLAN.md`; added `MISSION_CONTROL_AUTH_TOKEN` placeholder to `.env.example` |
+| 3.11 | Overall Test Suite | COMPLETED | **116 passing tests** across unit and integration suites with zero regressions |

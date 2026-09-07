@@ -3,16 +3,22 @@
 
 Next-Gen Shared Brain & Multi-Agent Mission Control web application.
 Serves interactive tabs: Overview, Agents, Tasks Kanban, Execution Flow,
-Memory Explorer, Handoff Viewer, Model Policy, Live Events, and Git Monitor.
+Memory Explorer, Handoff Viewer, Worktree Sandboxes, Live Events, and Git Monitor.
+Equipped with local security hardening: Bearer token auth for mutating actions,
+rate limiting, CORS local-origin restriction, security headers, and worktree approval gates.
 """
 from __future__ import annotations
 
 import datetime
+import hmac
 import json
 import os
+import secrets
 import subprocess
 import sys
 import threading
+import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
@@ -25,7 +31,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from brain.context.continuator import UniversalContinuator
 from brain.orchestrator.orchestrator import Orchestrator
 from brain.router.smart_router import SmartRouter
-from events.bus import EventBus
+from events.bus import Event, EventBus, EventType
 from handoffs.handoff_manager import HandoffManager
 from memory.store.memory_store import MemoryStore
 from providers.registry.bootstrap import create_default_registry
@@ -47,6 +53,90 @@ orchestrator = Orchestrator(
     workspace_dir=PROJECT_ROOT,
 )
 
+AUTH_TOKEN_ENV_VAR = "MISSION_CONTROL_AUTH_TOKEN"
+AUTH_TOKEN_FILE = PROJECT_ROOT / "runtime" / "mission_control.token"
+
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy": (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "font-src 'self' data:; "
+        "connect-src 'self'; "
+        "img-src 'self' data:;"
+    ),
+}
+
+
+def get_or_create_auth_token() -> str:
+    """Retrieve the mission control auth token from env or disk, or generate one."""
+    env_token = os.environ.get(AUTH_TOKEN_ENV_VAR)
+    if env_token and env_token.strip():
+        return env_token.strip()
+
+    if AUTH_TOKEN_FILE.is_file():
+        try:
+            token = AUTH_TOKEN_FILE.read_text(encoding="utf-8").strip()
+            if token:
+                return token
+        except Exception:
+            pass
+
+    token = secrets.token_urlsafe(32)
+    AUTH_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    AUTH_TOKEN_FILE.write_text(token, encoding="utf-8")
+    try:
+        os.chmod(AUTH_TOKEN_FILE, 0o600)
+    except Exception:
+        pass
+    return token
+
+
+class RateLimiter:
+    """Sliding-window in-memory rate limiter."""
+
+    def __init__(self, max_requests: int = 30, window_seconds: float = 60.0) -> None:
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._lock = threading.Lock()
+        self._requests: dict[str, list[float]] = {}
+
+    def is_allowed(self, client_id: str = "global") -> bool:
+        now = time.time()
+        cutoff = now - self.window_seconds
+        with self._lock:
+            timestamps = self._requests.setdefault(client_id, [])
+            self._requests[client_id] = [t for t in timestamps if t > cutoff]
+            if len(self._requests[client_id]) >= self.max_requests:
+                return False
+            self._requests[client_id].append(now)
+            return True
+
+    def reset(self) -> None:
+        with self._lock:
+            self._requests.clear()
+
+
+execution_rate_limiter = RateLimiter(max_requests=30, window_seconds=60.0)
+
+
+def is_allowed_origin(origin: str | None) -> bool:
+    """Enforce CORS policy: only local loopback origins are permitted."""
+    if not origin:
+        return True
+    try:
+        parsed = urllib.parse.urlparse(origin)
+        if parsed.scheme in ("http", "https"):
+            hostname = parsed.hostname
+            if hostname in ("127.0.0.1", "localhost", "::1"):
+                return True
+    except Exception:
+        pass
+    return False
+
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
@@ -54,7 +144,77 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 class MissionControlHandler(BaseHTTPRequestHandler):
 
+    def _apply_security_headers(self) -> None:
+        for k, v in SECURITY_HEADERS.items():
+            self.send_header(k, v)
+        origin = self.headers.get("Origin")
+        if origin and is_allowed_origin(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            self.send_header("Access-Control-Max-Age", "86400")
+
+    def _check_origin(self) -> bool:
+        origin = self.headers.get("Origin")
+        if origin and not is_allowed_origin(origin):
+            out = json.dumps({"error": "Forbidden", "message": "Disallowed cross-origin request"}).encode("utf-8")
+            self.send_response(403)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self._apply_security_headers()
+            self.end_headers()
+            self.wfile.write(out)
+            return False
+        return True
+
+    def _verify_auth(self, path: str) -> bool:
+        auth_header = self.headers.get("Authorization")
+        client_ip = self.client_address[0] if hasattr(self, "client_address") else "127.0.0.1"
+        valid = False
+
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
+            expected = get_or_create_auth_token()
+            if token and hmac.compare_digest(token, expected):
+                valid = True
+
+        if valid:
+            event_bus.emit(
+                Event(
+                    event_type=EventType.AUTH_SUCCESS,
+                    metadata={"path": path, "client": client_ip},
+                )
+            )
+            return True
+        else:
+            event_bus.emit(
+                Event(
+                    event_type=EventType.AUTH_FAILURE,
+                    metadata={"path": path, "client": client_ip},
+                )
+            )
+            out = json.dumps(
+                {"error": "Unauthorized", "message": "Valid Bearer token required"}
+            ).encode("utf-8")
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self._apply_security_headers()
+            self.end_headers()
+            self.wfile.write(out)
+            return False
+
+    def do_OPTIONS(self) -> None:
+        if not self._check_origin():
+            return
+        self.send_response(204)
+        self._apply_security_headers()
+        self.end_headers()
+
     def do_GET(self) -> None:
+        if not self._check_origin():
+            return
+
         path = self.path.split("?")[0]
 
         if path == "/":
@@ -85,11 +245,41 @@ class MissionControlHandler(BaseHTTPRequestHandler):
             self._serve_json({"markdown": content})
         elif path == "/api/git":
             self._serve_json(self._get_git_info())
+        elif path == "/api/worktrees":
+            records = orchestrator.worktrees.status()
+            if isinstance(records, list):
+                data = [r.to_dict() for r in records]
+            elif records:
+                data = [records.to_dict()]
+            else:
+                data = []
+            self._serve_json({"worktrees": data})
+        elif path == "/api/worktrees/diff":
+            query = self.path.split("?")[1] if "?" in self.path else ""
+            params = urllib.parse.parse_qs(query)
+            task_id = params.get("task_id", [None])[0]
+            if not task_id:
+                self._serve_json({"error": "Missing task_id query parameter"}, status=400)
+            else:
+                try:
+                    diff_data = orchestrator.worktrees.diff(task_id)
+                    self._serve_json(diff_data)
+                except ValueError as exc:
+                    self._serve_json({"error": str(exc)}, status=404)
+                except Exception as exc:
+                    self._serve_json({"error": str(exc)}, status=500)
+        elif path == "/api/token":
+            # Accessible on loopback to supply the authenticated session token to UI
+            self._serve_json({"token": get_or_create_auth_token()})
         else:
             self.send_response(404)
+            self._apply_security_headers()
             self.end_headers()
 
     def do_POST(self) -> None:
+        if not self._check_origin():
+            return
+
         path = self.path.split("?")[0]
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
@@ -98,6 +288,7 @@ class MissionControlHandler(BaseHTTPRequestHandler):
         except Exception:
             payload = {}
 
+        # 1. Unauthenticated endpoints
         if path == "/api/route":
             router = SmartRouter(registry)
             dec = router.route(
@@ -112,27 +303,173 @@ class MissionControlHandler(BaseHTTPRequestHandler):
                 "complexity": dec.complexity.value,
                 "reason": dec.reason,
             })
-        elif path == "/api/dispatch":
+            return
+
+        # 2. Mutating endpoints requiring Bearer token authentication
+        mutating_paths = {
+            "/api/dispatch",
+            "/api/continue",
+            "/api/worktrees/approve",
+            "/api/worktrees/reject",
+            "/api/worktrees/cleanup",
+            "/api/worktrees/recover",
+        }
+        if path in mutating_paths:
+            if not self._verify_auth(path):
+                return
+
+        # 3. Rate limiting for task execution endpoints
+        if path in ("/api/dispatch", "/api/continue"):
+            client_ip = self.client_address[0] if hasattr(self, "client_address") else "127.0.0.1"
+            if not execution_rate_limiter.is_allowed(client_ip):
+                self._serve_json(
+                    {
+                        "error": "Too Many Requests",
+                        "message": "Execution rate limit exceeded (30 req/min). Try again later.",
+                    },
+                    status=429,
+                )
+                return
+
+        # 4. Confirmation requirement for destructive actions
+        destructive_paths = {
+            "/api/worktrees/approve",
+            "/api/worktrees/reject",
+            "/api/worktrees/cleanup",
+        }
+        if path in destructive_paths:
+            if payload.get("confirm") is not True:
+                self._serve_json(
+                    {
+                        "error": "Confirmation required",
+                        "message": "Explicit confirmation ('confirm': true) required for destructive worktree operations",
+                    },
+                    status=400,
+                )
+                return
+
+        # 5. Endpoint dispatch handlers
+        if path == "/api/dispatch":
             task = orchestrator.plan_and_dispatch(
                 instruction=payload.get("instruction", "Untitled Task"),
                 preferred_agent=payload.get("agent"),
                 preferred_model=payload.get("model"),
+                files=payload.get("files"),
             )
             self._serve_json({"status": "created", "task": task.to_dict()})
         elif path == "/api/continue":
             ctx = orchestrator.build_continue_context()
-            # Execute off-thread so the HTTP request does not block on the agent.
             threading.Thread(target=orchestrator.continue_work, daemon=True).start()
             self._serve_json({"status": "continued", "context": ctx.to_dict()})
+        elif path == "/api/worktrees/approve":
+            task_id = payload.get("task_id")
+            if not task_id:
+                self._serve_json({"error": "Missing task_id"}, status=400)
+                return
+            try:
+                approver = payload.get("approver", "mission_control")
+                result = orchestrator.worktrees.apply(
+                    task_id=task_id, approver=approver, confirm=True
+                )
+                event_bus.emit(
+                    Event(
+                        event_type=EventType.DIFF_APPROVED,
+                        task_id=task_id,
+                        metadata={"approver": approver},
+                    )
+                )
+                event_bus.emit(
+                    Event(
+                        event_type=EventType.MERGE_APPLIED,
+                        task_id=task_id,
+                        metadata={"result": result},
+                    )
+                )
+                self._serve_json({"status": "applied", "task_id": task_id, "result": result})
+            except RuntimeError as exc:
+                self._serve_json(
+                    {"error": "Conflict or Dirty Canonical Tree", "message": str(exc)},
+                    status=409,
+                )
+            except Exception as exc:
+                self._serve_json({"error": str(exc)}, status=500)
+        elif path == "/api/worktrees/reject":
+            task_id = payload.get("task_id")
+            if not task_id:
+                self._serve_json({"error": "Missing task_id"}, status=400)
+                return
+            try:
+                reason = payload.get("reason", "Rejected via Mission Control")
+                result = orchestrator.worktrees.reject(task_id=task_id, confirm=True)
+                event_bus.emit(
+                    Event(
+                        event_type=EventType.DIFF_REJECTED,
+                        task_id=task_id,
+                        metadata={"reason": reason},
+                    )
+                )
+                event_bus.emit(
+                    Event(
+                        event_type=EventType.WORKTREE_DESTROYED,
+                        task_id=task_id,
+                        metadata={"action": "reject", "result": result},
+                    )
+                )
+                self._serve_json({"status": "rejected", "task_id": task_id, "result": result})
+            except Exception as exc:
+                self._serve_json({"error": str(exc)}, status=500)
+        elif path == "/api/worktrees/cleanup":
+            task_id = payload.get("task_id")
+            try:
+                if task_id:
+                    result = orchestrator.worktrees.remove(
+                        task_id=task_id,
+                        confirm=True,
+                        delete_branch=payload.get("delete_branch", True),
+                    )
+                    event_bus.emit(
+                        Event(
+                            event_type=EventType.WORKTREE_DESTROYED,
+                            task_id=task_id,
+                            metadata={"action": "cleanup_single"},
+                        )
+                    )
+                    self._serve_json({"status": "cleaned", "task_id": task_id, "result": result})
+                else:
+                    max_age = int(payload.get("max_age_hours", 24))
+                    cleaned = orchestrator.worktrees.cleanup(max_age_hours=max_age)
+                    for item in cleaned:
+                        event_bus.emit(
+                            Event(
+                                event_type=EventType.WORKTREE_DESTROYED,
+                                task_id=item.get("task_id"),
+                                metadata={"action": "cleanup_batch"},
+                            )
+                        )
+                    self._serve_json({"status": "cleaned", "cleaned": cleaned})
+            except Exception as exc:
+                self._serve_json({"error": str(exc)}, status=500)
+        elif path == "/api/worktrees/recover":
+            task_id = payload.get("task_id")
+            if not task_id:
+                self._serve_json({"error": "Missing task_id"}, status=400)
+                return
+            try:
+                record = orchestrator.worktrees.recover(task_id=task_id)
+                self._serve_json({"status": "recovered", "worktree": record.to_dict()})
+            except Exception as exc:
+                self._serve_json({"error": str(exc)}, status=500)
         else:
             self.send_response(404)
+            self._apply_security_headers()
             self.end_headers()
 
-    def _serve_json(self, data: Any) -> None:
+    def _serve_json(self, data: Any, status: int = 200) -> None:
         out = json.dumps(data).encode("utf-8")
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(out)))
+        self._apply_security_headers()
         self.end_headers()
         self.wfile.write(out)
 
@@ -147,19 +484,17 @@ class MissionControlHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "text/css")
             elif rel.endswith(".woff2"):
                 self.send_header("Content-Type", "font/woff2")
+            self._apply_security_headers()
             self.end_headers()
             with open(file_path, "rb") as f:
                 self.wfile.write(f.read())
         else:
             self.send_response(404)
+            self._apply_security_headers()
             self.end_headers()
 
     def _get_agents_runtime(self) -> dict[str, Any]:
-        """Registry view enriched with live task, session, handoff and error state.
-
-        Every agent — including Antigravity Account 2 — is rendered from the same
-        data path, so no agent is a second-class citizen in the UI.
-        """
+        """Registry view enriched with live task, session, handoff and error state."""
         providers = registry.to_dict()
         all_tasks = task_manager.list_tasks()
         sessions = orchestrator.sessions.list_recent(200)
@@ -324,6 +659,9 @@ class MissionControlHandler(BaseHTTPRequestHandler):
       <button onclick="showTab('tasks')" class="tab-btn w-full text-left px-3 py-2 rounded text-sm hover:bg-slate-800 text-slate-300 font-medium" data-tab="tasks">
         <i class="fa-solid fa-list-check mr-2 text-amber-400"></i> Tasks (Kanban)
       </button>
+      <button onclick="showTab('worktrees')" class="tab-btn w-full text-left px-3 py-2 rounded text-sm hover:bg-slate-800 text-slate-300 font-medium" data-tab="worktrees">
+        <i class="fa-solid fa-shield-halved mr-2 text-emerald-400"></i> Worktree Sandboxes
+      </button>
       <button onclick="showTab('flow')" class="tab-btn w-full text-left px-3 py-2 rounded text-sm hover:bg-slate-800 text-slate-300 font-medium" data-tab="flow">
         <i class="fa-solid fa-diagram-project mr-2 text-cyan-400"></i> Execution Flow
       </button>
@@ -427,6 +765,34 @@ class MissionControlHandler(BaseHTTPRequestHandler):
         </div>
       </section>
 
+      <!-- WORKTREES TAB -->
+      <section id="tab-worktrees" class="tab-pane hidden space-y-6">
+        <div class="flex items-center justify-between">
+          <div>
+            <h2 class="text-xl font-bold text-white mb-1">Isolated Git Worktree Sandboxes</h2>
+            <p class="text-sm text-slate-400">Deterministic, safe sandboxes where agents execute file modifications. Review diffs before applying or rejecting.</p>
+          </div>
+          <button onclick="cleanupOldWorktrees()" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 rounded text-xs transition flex items-center gap-1.5">
+            <i class="fa-solid fa-broom"></i> Cleanup Stale
+          </button>
+        </div>
+
+        <div id="worktrees-container" class="space-y-4">
+          <!-- Dynamically populated worktree cards -->
+        </div>
+
+        <!-- Diff Viewer Modal -->
+        <div id="diff-modal" class="hidden fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-6">
+          <div class="bg-slate-900 border border-slate-800 rounded-lg max-w-4xl w-full max-h-[85vh] flex flex-col shadow-2xl">
+            <div class="p-4 border-b border-slate-800 flex items-center justify-between">
+              <h3 id="diff-modal-title" class="font-bold text-sm text-white font-mono">Diff</h3>
+              <button onclick="closeDiffModal()" class="text-slate-400 hover:text-white text-sm px-2 py-1">✕</button>
+            </div>
+            <pre id="diff-modal-body" class="p-4 overflow-auto font-mono text-xs text-slate-300 flex-1 bg-slate-950 whitespace-pre"></pre>
+          </div>
+        </div>
+      </section>
+
       <!-- FLOW TAB -->
       <section id="tab-flow" class="tab-pane hidden space-y-6">
         <h2 class="text-xl font-bold text-white mb-2">Autonomous Execution Flow</h2>
@@ -446,9 +812,9 @@ class MissionControlHandler(BaseHTTPRequestHandler):
           <div class="flex items-center gap-3">
             <div class="px-3 py-1.5 bg-amber-950 border border-amber-700 text-amber-300 rounded">4. SWARM WORKER</div>
             <i class="fa-solid fa-arrow-right text-slate-500"></i>
-            <div class="px-3 py-1.5 bg-purple-950 border border-purple-700 text-purple-300 rounded">5. FILE LOCKS & EXECUTION</div>
+            <div class="px-3 py-1.5 bg-purple-950 border border-purple-700 text-purple-300 rounded">5. WORKTREE SANDBOX & DIFF</div>
             <i class="fa-solid fa-arrow-right text-slate-500"></i>
-            <div class="px-3 py-1.5 bg-emerald-950 border border-emerald-700 text-emerald-300 rounded">6. HANDOFF & CONTINUE</div>
+            <div class="px-3 py-1.5 bg-emerald-950 border border-emerald-700 text-emerald-300 rounded">6. HUMAN APPROVAL & MERGE</div>
           </div>
         </div>
       </section>
@@ -490,6 +856,28 @@ class MissionControlHandler(BaseHTTPRequestHandler):
   </div>
 
   <script>
+    let authToken = '';
+
+    async function initAuth() {
+      try {
+        const res = await fetch('/api/token');
+        if (res.ok) {
+          const data = await res.json();
+          authToken = data.token;
+        }
+      } catch (err) {
+        console.warn('Could not fetch token:', err);
+      }
+    }
+
+    async function fetchWithAuth(url, options = {}) {
+      options.headers = options.headers || {};
+      if (authToken) {
+        options.headers['Authorization'] = 'Bearer ' + authToken;
+      }
+      return fetch(url, options);
+    }
+
     function showTab(tabId) {
       document.querySelectorAll('.tab-pane').forEach(el => el.classList.add('hidden'));
       document.querySelectorAll('.tab-pane').forEach(el => el.classList.remove('block'));
@@ -582,6 +970,9 @@ class MissionControlHandler(BaseHTTPRequestHandler):
         document.getElementById('badge-running').textContent = cRun;
         document.getElementById('badge-completed').textContent = cDone;
 
+        // Render Worktrees
+        await renderWorktrees();
+
         // Render Memories
         const resMem = await fetch('/api/memory');
         const memData = await resMem.json();
@@ -633,28 +1024,181 @@ class MissionControlHandler(BaseHTTPRequestHandler):
       }
     }
 
+    async function renderWorktrees() {
+      try {
+        const res = await fetch('/api/worktrees');
+        const data = await res.json();
+        const container = document.getElementById('worktrees-container');
+        if (!container) return;
+        container.innerHTML = '';
+
+        if (!data.worktrees || data.worktrees.length === 0) {
+          container.innerHTML = `
+            <div class="p-8 bg-slate-900/50 border border-slate-800 rounded-lg text-center text-slate-500 text-sm">
+              <i class="fa-solid fa-code-commit text-2xl mb-2 text-slate-600"></i>
+              <div>No active sandbox worktrees. Mutating tasks will automatically instantiate sandboxes here.</div>
+            </div>
+          `;
+          return;
+        }
+
+        for (const wt of data.worktrees) {
+          const card = document.createElement('div');
+          card.className = 'bg-slate-900 border border-slate-800 p-5 rounded-lg space-y-3';
+          
+          const statusBadge = {
+            ACTIVE: 'bg-cyan-950 text-cyan-400 border border-cyan-800',
+            PENDING_REVIEW: 'bg-amber-950 text-amber-300 border border-amber-800',
+            APPROVED: 'bg-indigo-950 text-indigo-300 border border-indigo-800',
+            APPLIED: 'bg-emerald-950 text-emerald-300 border border-emerald-800',
+            REJECTED: 'bg-red-950 text-red-400 border border-red-800',
+            FAILED: 'bg-red-950 text-red-400 border border-red-800',
+            CLEANED: 'bg-slate-800 text-slate-500 border border-slate-700',
+          }[wt.status] || 'bg-slate-800 text-slate-400';
+
+          const filesText = (wt.files_changed && wt.files_changed.length > 0)
+            ? wt.files_changed.join(', ')
+            : (wt.diff_stat || 'No modifications yet');
+
+          card.innerHTML = `
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-3">
+                <span class="font-bold text-white text-sm font-mono">${wt.task_id}</span>
+                <span class="text-[10px] px-2 py-0.5 rounded font-mono ${statusBadge}">${wt.status}</span>
+              </div>
+              <div class="text-xs text-slate-400 font-mono">Branch: <span class="text-emerald-400">${wt.branch}</span></div>
+            </div>
+            <div class="grid grid-cols-3 gap-2 text-xs text-slate-400 bg-slate-950 p-3 rounded border border-slate-850">
+              <div>Agent: <span class="text-slate-200">${wt.agent_id}</span></div>
+              <div>Account: <span class="text-slate-200">${wt.account_id}</span></div>
+              <div>Base commit: <span class="text-slate-200 font-mono">${(wt.base_commit || '').slice(0, 8)}</span></div>
+            </div>
+            <div class="text-xs text-slate-400 font-mono">
+              Changes: <span class="text-slate-300">${filesText}</span>
+              ${wt.insertions ? `<span class="text-emerald-400 ml-2">+${wt.insertions}</span>` : ''}
+              ${wt.deletions ? `<span class="text-red-400 ml-1">-${wt.deletions}</span>` : ''}
+            </div>
+            <div class="flex items-center gap-2 pt-2 border-t border-slate-800">
+              <button onclick="viewWorktreeDiff('${wt.task_id}')" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded text-xs transition flex items-center gap-1">
+                <i class="fa-solid fa-file-lines"></i> View Diff
+              </button>
+              ${wt.status === 'PENDING_REVIEW' || wt.status === 'ACTIVE' ? `
+                <button onclick="approveWorktree('${wt.task_id}')" class="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 text-white rounded text-xs font-medium transition flex items-center gap-1">
+                  <i class="fa-solid fa-check"></i> Approve & Apply
+                </button>
+                <button onclick="rejectWorktree('${wt.task_id}')" class="px-3 py-1.5 bg-red-800 hover:bg-red-700 text-white rounded text-xs font-medium transition flex items-center gap-1">
+                  <i class="fa-solid fa-xmark"></i> Reject
+                </button>
+              ` : ''}
+            </div>
+          `;
+          container.appendChild(card);
+        }
+      } catch (err) {
+        console.error('Error rendering worktrees:', err);
+      }
+    }
+
+    async function viewWorktreeDiff(taskId) {
+      try {
+        const res = await fetch('/api/worktrees/diff?task_id=' + encodeURIComponent(taskId));
+        const data = await res.json();
+        document.getElementById('diff-modal-title').textContent = 'Diff for task: ' + taskId + ' (' + (data.branch || '') + ')';
+        document.getElementById('diff-modal-body').textContent = data.diff || data.diff_stat || '(Empty diff or no staged changes)';
+        document.getElementById('diff-modal').classList.remove('hidden');
+      } catch (err) {
+        alert('Failed to load diff: ' + err.message);
+      }
+    }
+
+    function closeDiffModal() {
+      document.getElementById('diff-modal').classList.add('hidden');
+    }
+
+    async function approveWorktree(taskId) {
+      if (!confirm('Apply sandbox changes from task ' + taskId + ' into canonical repository?')) return;
+      try {
+        const res = await fetchWithAuth('/api/worktrees/approve', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ task_id: taskId, confirm: true })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          alert('Changes successfully merged into canonical repository!');
+          refreshData();
+        } else {
+          alert('Error approving worktree: ' + (data.message || data.error));
+        }
+      } catch (err) {
+        alert('Network error approving worktree: ' + err.message);
+      }
+    }
+
+    async function rejectWorktree(taskId) {
+      if (!confirm('Reject and destroy sandbox worktree for task ' + taskId + '?')) return;
+      try {
+        const res = await fetchWithAuth('/api/worktrees/reject', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ task_id: taskId, confirm: true })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          alert('Worktree sandbox rejected and destroyed.');
+          refreshData();
+        } else {
+          alert('Error rejecting worktree: ' + (data.message || data.error));
+        }
+      } catch (err) {
+        alert('Network error rejecting worktree: ' + err.message);
+      }
+    }
+
+    async function cleanupOldWorktrees() {
+      if (!confirm('Cleanup all stale worktree sandboxes older than 24 hours?')) return;
+      try {
+        const res = await fetchWithAuth('/api/worktrees/cleanup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ confirm: true, max_age_hours: 24 })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          alert('Cleanup complete.');
+          refreshData();
+        } else {
+          alert('Error during cleanup: ' + (data.message || data.error));
+        }
+      } catch (err) {
+        alert('Network error: ' + err.message);
+      }
+    }
+
     async function dispatchTask() {
       const input = document.getElementById('quick-instruction');
       const agentSel = document.getElementById('quick-agent');
       const text = input.value.trim();
       if (!text) return;
-      await fetch('/api/dispatch', {
+      await fetchWithAuth('/api/dispatch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: json.stringify({ instruction: text, agent: agentSel.value || null })
+        body: JSON.stringify({ instruction: text, agent: agentSel.value || null })
       });
       input.value = '';
       refreshData();
     }
 
     async function triggerContinue() {
-      await fetch('/api/continue', { method: 'POST' });
+      await fetchWithAuth('/api/continue', { method: 'POST' });
       alert('Universal Continue triggered!');
       refreshData();
     }
 
-    setInterval(refreshData, 3000);
-    refreshData();
+    initAuth().then(() => {
+      refreshData();
+      setInterval(refreshData, 3000);
+    });
   </script>
 </body>
 </html>"""
@@ -662,6 +1206,7 @@ class MissionControlHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(out)))
+        self._apply_security_headers()
         self.end_headers()
         self.wfile.write(out)
 

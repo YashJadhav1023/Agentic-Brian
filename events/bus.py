@@ -49,6 +49,24 @@ class EventType(str, Enum):
     ANTIGRAVITY_ACCOUNT2_MODEL_SELECTED = "ANTIGRAVITY_ACCOUNT2_MODEL_SELECTED"
     ANTIGRAVITY_ACCOUNT2_HANDOFF = "ANTIGRAVITY_ACCOUNT2_HANDOFF"
 
+    # Phase 3 Security & Audit Events
+    AUTH_SUCCESS = "AUTH_SUCCESS"
+    AUTH_FAILURE = "AUTH_FAILURE"
+    TASK_EXECUTION_REQUESTED = "TASK_EXECUTION_REQUESTED"
+    TASK_EXECUTION_STARTED = "TASK_EXECUTION_STARTED"
+    TASK_EXECUTION_COMPLETED = "TASK_EXECUTION_COMPLETED"
+    TASK_EXECUTION_FAILED = "TASK_EXECUTION_FAILED"
+    PERMISSION_ESCALATION_REQUESTED = "PERMISSION_ESCALATION_REQUESTED"
+    PERMISSION_ESCALATION_GRANTED = "PERMISSION_ESCALATION_GRANTED"
+    PERMISSION_ESCALATION_DENIED = "PERMISSION_ESCALATION_DENIED"
+
+    # Phase 3 Worktree & Sandbox Events
+    WORKTREE_CREATED = "WORKTREE_CREATED"
+    WORKTREE_DESTROYED = "WORKTREE_DESTROYED"
+    DIFF_APPROVED = "DIFF_APPROVED"
+    DIFF_REJECTED = "DIFF_REJECTED"
+    MERGE_APPLIED = "MERGE_APPLIED"
+
 
 @dataclass
 class Event:
@@ -78,6 +96,20 @@ class EventBus:
         with self._lock:
             self._subscribers.append(callback)
 
+    def emit(self, event: Event) -> Event:
+        line = json.dumps(event.to_dict()) + "\n"
+
+        with self._lock:
+            with open(self._log_path, "a", encoding="utf-8") as f:
+                f.write(line)
+            for sub in self._subscribers:
+                try:
+                    sub(event)
+                except Exception:
+                    pass
+
+        return event
+
     def publish(
         self,
         event_type: EventType,
@@ -93,18 +125,7 @@ class EventBus:
             session_id=session_id,
             metadata=metadata or {},
         )
-        line = json.dumps(evt.to_dict()) + "\n"
-
-        with self._lock:
-            with open(self._log_path, "a", encoding="utf-8") as f:
-                f.write(line)
-            for sub in self._subscribers:
-                try:
-                    sub(evt)
-                except Exception:
-                    pass
-
-        return evt
+        return self.emit(evt)
 
     def get_recent_events(self, limit: int = 50) -> list[Event]:
         if not self._log_path.exists():

@@ -1,98 +1,101 @@
 # Troubleshooting
 
-## Account 2 task succeeds but returns nothing
+## 1. Worktree Sandbox Issues
 
-**Symptom** — exit `0`, `status: SUCCESS`, empty response, and stderr containing:
+### Cannot apply sandbox changes: canonical working tree has uncommitted user changes
+**Symptom** — `worktree approve` or `POST /api/worktrees/approve` fails with:
+```
+Cannot apply sandbox changes: canonical working tree has N uncommitted user changes.
+Commit or stash your changes in ... before applying.
+```
+**Cause** — The safe sandbox guard enforces that sandbox merges never clobber local developer edits in progress.
+**Fix** — Stash or commit your uncommitted changes in the canonical repository, then retry:
+```bash
+git stash
+python3 scripts/brain.py worktree approve <task_id> --confirm
+git stash pop
+```
 
+### Stale or orphaned worktrees
+**Symptom** — Unfinished worktrees remain in `runtime/sandboxes/`.
+**Fix** — Inspect worktree status, view diff, and clean or recover:
+```bash
+python3 scripts/brain.py worktree status
+python3 scripts/brain.py worktree diff <task_id>
+python3 scripts/brain.py worktree reject <task_id> --confirm   # if unwanted
+python3 scripts/brain.py worktree cleanup --confirm            # prune stale >24h
+```
+
+---
+
+## 2. Mission Control Security & API Issues
+
+### Mutating endpoint returns 401 Unauthorized
+**Symptom** — `POST /api/dispatch`, `/api/continue`, or `/api/worktrees/*` returns:
+```json
+{"error": "Unauthorized", "message": "Valid Bearer token required"}
+```
+**Cause** — Missing or invalid `Authorization: Bearer <token>` header.
+**Fix** — Include the bearer token generated in `runtime/mission_control.token` (or set via `MISSION_CONTROL_AUTH_TOKEN`):
+```bash
+TOKEN=$(cat runtime/mission_control.token)
+curl -X POST http://127.0.0.1:3333/api/dispatch \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"instruction": "..."}'
+```
+
+### API returns 403 Forbidden
+**Symptom** — Any request with an external `Origin` header returns `403 Forbidden`.
+**Cause** — Strict CORS protection rejects origins other than `http://127.0.0.1:*` and `http://localhost:*`.
+**Fix** — Connect directly from localhost/loopback or verify your browser origin.
+
+### API returns 429 Too Many Requests
+**Symptom** — `/api/dispatch` or `/api/continue` returns:
+```json
+{"error": "Too Many Requests", "message": "Execution rate limit exceeded (30 req/min). Try again later."}
+```
+**Cause** — Sliding-window rate limiter triggered (maximum 30 execution requests per minute).
+**Fix** — Back off and wait for the window to slide (up to 60 seconds).
+
+---
+
+## 3. Account 2 & Agent Execution
+
+### Account 2 task succeeds but returns nothing
+**Symptom** — Exit `0`, `status: SUCCESS`, empty response, and stderr containing:
 ```
 no output produced — a tool required the "command" permission that headless mode
 cannot prompt for, so it was auto-denied.
 ```
+**Cause** — Headless print mode cannot prompt for tool permissions interactively, so the tool was auto-denied.
+**Fixes, least privileged first**:
+1. Re-run the mutating task with `--allow-tool-permissions`:
+   ```bash
+   python3 scripts/brain.py plan "Write test" --allow-tool-permissions
+   ```
+2. Add a scoped rule under `permissions.allow` in `~/.gemini/antigravity-ide/settings.json`.
 
-**Cause** — headless print mode has nobody to approve a tool permission prompt,
-so the tool is auto-denied. The task cannot read files, so it has nothing to say.
+### `actual_model` is always `unknown`
+**Working as intended**. The Antigravity CLI output format does not report the serving model identifier, and neither Kiro nor Cline report one. `requested_model` records what was requested; fabricating `actual_model` would corrupt audit logs.
 
-**This system marks that run FAILED**, not completed, and appends a hint. Fixes,
-least privileged first:
-
-1. Add a scoped rule under `permissions.allow` in the account profile's
-   `settings.json` (preferred — allows only what is needed).
-2. Re-run the task with `--allow-tool-permissions`.
-3. Set `dangerously_skip_permissions: true` for that account in
-   `config/providers.json` (broadest; affects every task on the account).
-
-Pure reasoning tasks need none of this.
-
-## `actual_model` is always `unknown`
-
-Working as intended. The Antigravity JSON payload has no model field, and neither
-Kiro nor Cline report one. `requested_model` records what was asked for.
-Fabricating `actual_model` would corrupt every downstream record. See
-`docs/MODEL_ROUTING.md`.
-
-## Agent reported OFFLINE
-
+### Agent reported OFFLINE
 ```bash
 python3 scripts/brain.py health --agent antigravity-account-2 --deep
 ```
+- *binary not found* — check `command` in `config/providers.json`; verify `which agy`.
+- *profile directory missing / not writable* — confirm `~/.gemini/antigravity-ide` permissions.
+- *session probe timed out* — network or provider outage; deep probe results are cached for 300 s.
 
-- *binary not found* — check `command` / `fallback_commands` in
-  `config/providers.json`; confirm `which agy`.
-- *profile directory does not exist / not readable / not writable* — confirm
-  `~/.gemini/antigravity-ide` exists with the right ownership.
-- *session unusable* — the account's CLI session needs re-authentication. Do that
-  through the CLI itself; this system never touches credentials.
-- *session probe timed out* — network or provider outage; retry, the result is
-  cached for 300 s.
-
-## Kiro run fails on the model
-
+### Task stuck in BLOCKED
+Check file locks or health pre-flight failure:
+```bash
+ls locks/
+python3 scripts/brain.py status
 ```
-The model 'claude-opus4.6' is not available. Please use '/model' to select a different model
-```
+Locks carry a TTL and auto-reclaim upon expiration.
 
-That is the machine's stored Kiro default, not this repository. The adapter now
-always passes `--model` explicitly (including `auto`) to bypass a stale default.
-Valid ids are listed in `config/providers.json`.
-
-## Task stuck in BLOCKED
-
-Either the agent failed its health pre-flight, or a file lock could not be
-acquired. Check `task.errors`, then `ls locks/`. Locks carry a TTL and reclaim
-themselves; a task can simply be re-planned.
-
-## Task stuck in RUNNING after a crash
-
+### Task stuck in RUNNING after a crash
 ```bash
 python3 -c "from tasks.manager import TaskManager; print(TaskManager().recover_orphaned_tasks())"
 ```
-
-## `continue` picks the wrong thing
-
-`continue --dry-run` prints the resolved source, target agent, conversation and
-next action. Precedence: matching handoff, then failure recovery, then latest
-handoff, then task assignment. `CANCELLED` tasks are skipped — cancel a task you
-do not want resumed:
-
-```bash
-python3 -c "
-from tasks.manager import TaskManager, TaskStatus
-TaskManager().update_status('task-xxxxxxxx', TaskStatus.CANCELLED, error='not needed')"
-```
-
-## Conversation not resumed across a handoff
-
-Expected when the handoff moves to a different agent. Conversation ids are
-account-scoped and are never replayed against another account. The next agent
-receives the handoff and relevant memory instead.
-
-## Mission Control shows no agents
-
-Check that `config/providers.json` parses and that accounts are `enabled`.
-`list_active_adapters()` only returns agents that are both enabled and healthy.
-
-## Tests write into real state
-
-They must not. Every test uses a `TemporaryDirectory`. If you see new files in
-`tasks/` or `handoffs/` after a test run, that test is constructing a manager
-without an explicit root.

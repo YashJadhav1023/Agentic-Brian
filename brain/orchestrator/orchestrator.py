@@ -15,6 +15,7 @@ from typing import Any
 from brain.context.continuator import ContinueContext, UniversalContinuator
 from brain.orchestrator.swarm import SwarmWorkerPool
 from brain.router.smart_router import SmartRouter
+from brain.worktree.worktree_manager import WorktreeManager
 from events.bus import EventBus, EventType
 from handoffs.handoff_manager import HandoffManager
 from memory.store.memory_store import MemoryStore
@@ -36,6 +37,7 @@ class Orchestrator:
         handoff_manager: HandoffManager | None = None,
         session_manager: SessionManager | None = None,
         memory_store: MemoryStore | None = None,
+        worktree_manager: WorktreeManager | None = None,
     ) -> None:
         self._workspace = workspace_dir or Path.cwd()
         self._registry = registry or create_default_registry()
@@ -48,6 +50,7 @@ class Orchestrator:
         )
         self._session_manager = session_manager or SessionManager()
         self._memory_store = memory_store or MemoryStore()
+        self._worktree_manager = worktree_manager or WorktreeManager(canonical_repo=self._workspace)
         self._router = SmartRouter(self._registry, task_manager=self._task_manager)
         self._swarm = SwarmWorkerPool(
             task_manager=self._task_manager,
@@ -57,11 +60,16 @@ class Orchestrator:
             memory_store=self._memory_store,
             session_manager=self._session_manager,
             workspace_dir=self._workspace,
+            worktree_manager=self._worktree_manager,
         )
 
     # ------------------------------------------------------------------
     # Accessors
     # ------------------------------------------------------------------
+    @property
+    def worktrees(self) -> WorktreeManager:
+        return self._worktree_manager
+
     @property
     def registry(self) -> ProviderRegistry:
         return self._registry

@@ -2,67 +2,53 @@
 
 **Canonical repository:** `~/YashDevops/Agentic_shared_memory/`
 **Remote:** `https://github.com/YashJadhav1023/Agentic-Brian.git` (branch `main`)
-**Status:** Phase 2 complete. Legacy implementation still in place and untouched.
+**Status:** Phase 3 complete (Safe Sandboxed Execution + Mission Control Security). Legacy implementation untouched.
 
 ---
 
-## Two systems currently coexist
+## 1. Two systems currently coexist
 
-| | Legacy | Canonical (this repo) |
+| Dimension | Legacy | Canonical (this repo) |
 |---|---|---|
 | Location | `~/YashDevops/Agentic_os/scripts/brain/` (15 Python modules + shell CLI) | `~/YashDevops/Agentic_shared_memory/` |
-| Memory | `~/agentic-brain` Markdown knowledge graph via the `brain` MCP server (basic-memory) | `memory/store/shared_memory.db` (SQLite) |
+| Memory | `~/agentic-brain` Markdown knowledge graph via `brain` MCP server | `memory/store/shared_memory.db` (SQLite) |
 | Entry point | `brain` shell CLI, `brain swarm …` | `python3 scripts/brain.py …` |
-| Account 2 | **delivery only** — recorded for a human to drive in the IDE | **headless first-class agent** |
-| Sandbox | git worktree on `brain/swarm/<task-id>` | none; tasks run in the workspace |
-| Status | in active use, referenced by machine-wide steering docs | Phase 2 verified |
+| Account 2 | Delivery only — recorded for human editor execution | Headless first-class production agent |
+| Sandbox | `git worktree` on `brain/swarm/<task-id>` | Safe isolated `git worktree` on `agentic/task/<task-id>` with human approval gate |
+| Security | Loopback only, unauthenticated POST | Loopback only + Bearer token auth + CORS restriction + rate limiting + security headers |
+| Status | Legacy in active use in Agentic_os | Phase 3 verified (116 tests passing) |
 
-**Nothing has been deleted.** The legacy implementation is the one wired into
-`~/.kiro/steering/shared-brain.md` and `AGENTS.md`, so removing it would break
-every agent on the machine. It stays until the canonical system is adopted
-deliberately.
-
-The two do not interfere: different directories, different stores, different
-entry points, different task files.
+The legacy system in `~/YashDevops/Agentic_os/` remains untouched and functional.
 
 ---
 
-## Migration inventory
+## 2. Migration Inventory
 
-| Legacy module | Canonical equivalent | Status |
+| Component | Canonical Implementation | Phase 3 Status |
 |---|---|---|
-| `agent_adapters.py` | `agents/` + `providers/registry/` | MIGRATED (rebuilt, config-driven) |
-| `model_policy.py` | `models/policies/model_policy.py` | MIGRATED (catalogues re-verified) |
-| `swarm.py` | `brain/orchestrator/swarm.py` + `tasks/` | MIGRATED (no git-worktree sandbox) |
-| `orchestrator.py` | `brain/orchestrator/orchestrator.py` | MIGRATED |
-| `execution.py` | `locks/file_locker.py` | MIGRATED (locking only) |
-| `lifecycle.py` | `tasks/manager.py` | MIGRATED |
-| `cognitive_engine.py` | `memory/retrieval/retriever.py` | MIGRATED (simpler; no 2-hop graph expansion) |
-| `dashboard.py`, `dashboard_execution.py`, `static/` | `ui/dashboard/` | MIGRATED |
-| `brain` (shell CLI) | `scripts/brain.py` | MIGRATED |
-| `orchestrator_mcp.py` | — | NOT MIGRATED (no MCP server here yet) |
-| `search_sidecar.py` | — | NOT MIGRATED (no semantic sidecar) |
-| `sentinel.py` | — | NOT MIGRATED (no continuous monitor) |
-| `install-protocol.py`, `register-brain-mcp.py`, `attach-antigravity-key.sh` | — | NOT MIGRATED (machine-level setup, stays legacy) |
-| `test_brain_*.py` | `tests/unit/`, `tests/integration/` | REPLACED (87 tests written against this codebase) |
+| Agent Adapters | `agents/` + `providers/registry/` | COMPLETED |
+| Model Policies | `models/policies/model_policy.py` | COMPLETED |
+| Swarm Worker Pool | `brain/orchestrator/swarm.py` | COMPLETED (Sandbox integrated) |
+| Git Worktree Sandboxing | `brain/worktree/worktree_manager.py` | COMPLETED (Phase 3 Objective A) |
+| File Locking & Concurrency | `locks/file_locker.py` | COMPLETED |
+| Mission Control & Security | `ui/dashboard/dashboard.py` | COMPLETED (Phase 3 Objective B) |
+| CLI Interface | `scripts/brain.py` | COMPLETED (Added `worktree` subcommands) |
+| Telemetry & Audit | `events/bus.py` | COMPLETED (Phase 3 security & worktree events) |
+| Test Suite | `tests/unit/`, `tests/integration/` | 116 passing tests (0 failures, 0 errors) |
 
-## Deliberate differences from the legacy system
+---
 
-1. **Account 2 executes.** The legacy system treats `antigravity-ide` as a
-   delivery target requiring a human. Verified headless execution makes that
-   unnecessary.
-2. **No git worktree sandbox.** Legacy headless tasks ran in a throwaway
-   worktree because agents ran with approval gates disabled. Here the default is
-   least privilege, so tasks cannot mutate files unless escalation is opted into.
-   If escalated execution becomes routine, port the sandbox before doing so.
-3. **No second LLM, no MCP dependency.** This system is a subprocess orchestrator
-   over local CLIs.
+## 3. Deliberate Architectural Decisions
 
-## Remaining steps to full adoption
+1. **Headless Account 2 Execution**: Proven with `--app_data_dir=antigravity-ide`. No human driving required.
+2. **Safe Isolated Worktrees**: Agents modifying files execute in a sandboxed git worktree. Canonical repository working tree is protected and never dirty-merged.
+3. **Defense-in-Depth Mission Control**: Mutating endpoints require Bearer auth and confirmation flags; CORS is locked to local origins.
+4. **Least Privilege by Default**: Tool permissions remain off unless explicitly requested per task.
 
-1. Run both systems in parallel and compare outcomes on real work.
-2. Port the git-worktree sandbox if escalated execution becomes the norm.
-3. Decide whether the SQLite store should sync with the `~/agentic-brain`
-   Markdown graph, or replace it.
-4. Only then update the machine-wide steering docs and retire
-   `Agentic_os/scripts/brain/`.
+---
+
+## 4. Remaining Steps to Full Adoption
+
+1. Validate live workflows across all 4 agent accounts.
+2. Decide whether SQLite store should synchronize with `~/agentic-brain` Markdown graph or remain separate.
+3. Update machine-wide steering docs and deprecate `Agentic_os/scripts/brain/` when ready.

@@ -20,12 +20,14 @@ from __future__ import annotations
 
 import concurrent.futures
 import os
+import re
 import subprocess
 import uuid
 from pathlib import Path
 from typing import Any
 
 from agents.base.adapter import UNKNOWN_MODEL, AgentAdapter, TaskExecutionResult
+from brain.worktree.worktree_manager import WorktreeManager, WorktreeRecord, WorktreeStatus
 from events.bus import EventBus, EventType
 from handoffs.handoff_manager import HandoffManager, HandoffRecord
 from locks.file_locker import FileLocker
@@ -72,6 +74,7 @@ class SwarmWorkerPool:
         session_manager: SessionManager | None = None,
         workspace_dir: Path | None = None,
         max_workers: int = MAX_CONCURRENT_AGENTS,
+        worktree_manager: WorktreeManager | None = None,
     ) -> None:
         self._task_manager = task_manager
         self._registry = registry or create_default_registry()
@@ -83,6 +86,11 @@ class SwarmWorkerPool:
         self._session_manager = session_manager or SessionManager()
         self._workspace = workspace_dir or Path.cwd()
         self._max_workers = max(1, max_workers)
+        self._worktree_manager = worktree_manager or WorktreeManager(canonical_repo=self._workspace)
+
+    @property
+    def worktrees(self) -> WorktreeManager:
+        return self._worktree_manager
 
     # ------------------------------------------------------------------
     # Telemetry helpers
@@ -176,6 +184,62 @@ class SwarmWorkerPool:
         if task.conversation_id:
             options.setdefault("conversation_id", task.conversation_id)
         return options
+
+    def _is_mutating_task(self, task: Task, options: dict[str, Any]) -> bool:
+        """Classify task as READ_ONLY or MUTATING according to Phase 3 policy.
+
+        Tasks that escalate tool permissions, declare target files, request sandbox,
+        or invoke mutating actions MUST run inside an isolated git worktree.
+        """
+        # 1. Explicit execution options overrides
+        if "sandbox" in options:
+            return bool(options["sandbox"])
+        if "is_mutating" in options:
+            return bool(options["is_mutating"])
+        if getattr(task, "execution_options", None):
+            if "sandbox" in task.execution_options:
+                return bool(task.execution_options["sandbox"])
+            if "is_mutating" in task.execution_options:
+                return bool(task.execution_options["is_mutating"])
+
+        # 2. Tool permissions escalation automatically triggers worktree isolation
+        if (
+            options.get("dangerously_skip_permissions")
+            or options.get("allow_tool_permissions")
+            or options.get("trust_all_tools")
+            or options.get("auto_approve")
+        ):
+            return True
+
+        # 3. File targets declared
+        if task.files:
+            return True
+
+        # 4. Tools requested
+        if task.tools:
+            return True
+
+        # 5. Semantic keyword analysis of task text
+        text = f"{task.title} {task.description}".lower()
+        mutating_verbs = {
+            "create", "write", "modify", "delete", "edit", "refactor",
+            "update", "fix", "add", "patch", "implement", "build",
+            "scaffold", "generate", "remove", "touch", "rename"
+        }
+        read_only_phrases = {
+            "inspect", "explain", "analyze", "review logs", "show",
+            "describe", "what is", "how do", "architecture review", "list"
+        }
+        words = set(re.findall(r"\b[a-z-]+\b", text))
+        has_mutating = bool(words & mutating_verbs)
+        has_read_only = any(phrase in text for phrase in read_only_phrases)
+
+        if has_mutating:
+            return True
+        if has_read_only:
+            return False
+
+        return False
 
     # ------------------------------------------------------------------
     # Execution
@@ -321,14 +385,121 @@ class SwarmWorkerPool:
             prompt, memory_refs = self._build_prompt(task)
             options = self._resolve_execution_options(task, session_id)
 
+            self._event_bus.publish(
+                EventType.TASK_EXECUTION_REQUESTED,
+                agent_id=agent_id,
+                task_id=task.task_id,
+                session_id=session_id,
+                metadata={"requested_model": task.assigned_model},
+            )
+
+            # Check privilege escalation audit
+            escalation_requested = bool(
+                options.get("dangerously_skip_permissions")
+                or options.get("allow_tool_permissions")
+                or options.get("trust_all_tools")
+                or options.get("auto_approve")
+            )
+            if escalation_requested:
+                self._event_bus.publish(
+                    EventType.PERMISSION_ESCALATION_REQUESTED,
+                    agent_id=agent_id,
+                    task_id=task.task_id,
+                    session_id=session_id,
+                )
+                self._event_bus.publish(
+                    EventType.PERMISSION_ESCALATION_GRANTED,
+                    agent_id=agent_id,
+                    task_id=task.task_id,
+                    session_id=session_id,
+                )
+
+            # Resolve sandbox isolation: mutating or tool-escalated tasks get an isolated worktree
+            needs_sandbox = self._is_mutating_task(task, options)
+            worktree_record: WorktreeRecord | None = None
+            work_dir = self._workspace
+
+            if needs_sandbox and self._worktree_manager.is_git_repository():
+                try:
+                    worktree_record = self._worktree_manager.create(
+                        task_id=task.task_id,
+                        agent_id=agent_id,
+                        account_id=adapter.account_id,
+                    )
+                    work_dir = Path(worktree_record.path)
+                    self._event_bus.publish(
+                        EventType.WORKTREE_CREATED,
+                        agent_id=agent_id,
+                        task_id=task.task_id,
+                        session_id=session_id,
+                        metadata={
+                            "path": worktree_record.path,
+                            "branch": worktree_record.branch,
+                            "base_commit": worktree_record.base_commit,
+                            "canonical_dirty": worktree_record.canonical_dirty_at_creation,
+                            "canonical_dirty_count": worktree_record.canonical_dirty_count,
+                        },
+                    )
+                    prompt += (
+                        f"\n\n[SANDBOX WORKSPACE]\n"
+                        f"You are executing in an isolated Git worktree at: {worktree_record.path}\n"
+                        f"Branch: {worktree_record.branch}\n"
+                        f"The canonical project repository is completely protected and untouched.\n"
+                        f"Make all requested file modifications directly in this isolated worktree directory.\n"
+                        f"Do not commit, push, or switch branches; your modifications will be reviewed and diffed automatically."
+                    )
+                except Exception as wt_err:
+                    error = f"Failed to initialize sandbox worktree: {wt_err}"
+                    self._task_manager.update_status(task.task_id, TaskStatus.FAILED, error=error)
+                    self._event_bus.publish(
+                        EventType.TASK_EXECUTION_FAILED,
+                        agent_id=agent_id,
+                        task_id=task.task_id,
+                        session_id=session_id,
+                        metadata={"error": error},
+                    )
+                    return TaskExecutionResult(
+                        task_id=task.task_id,
+                        agent_id=agent_id,
+                        account_id=adapter.account_id,
+                        provider=adapter.provider,
+                        success=False,
+                        exit_code=1,
+                        output="",
+                        error=error,
+                        actual_model=UNKNOWN_MODEL,
+                        session_id=session_id,
+                    )
+
+            self._event_bus.publish(
+                EventType.TASK_EXECUTION_STARTED,
+                agent_id=agent_id,
+                task_id=task.task_id,
+                session_id=session_id,
+                metadata={"work_dir": str(work_dir), "sandboxed": worktree_record is not None},
+            )
+
             result = adapter.execute(
                 task_id=task.task_id,
                 prompt=prompt,
                 model=task.assigned_model,
-                work_dir=self._workspace,
+                work_dir=work_dir,
                 timeout_seconds=300,
                 options=options,
             )
+
+            # If executing in sandbox, capture snapshot and diff
+            if worktree_record:
+                snapshot = self._worktree_manager.snapshot(task.task_id)
+                diff_info = self._worktree_manager.diff(task.task_id)
+                if snapshot.get("changed"):
+                    result.files_touched = list(snapshot.get("files_changed", []))
+                    for f in result.files_touched:
+                        if f not in task.files:
+                            task.files.append(f)
+                result.raw_response["worktree"] = worktree_record.to_dict()
+                result.raw_response["sandbox_snapshot"] = snapshot
+                result.raw_response["diff"] = diff_info
 
             # Honest model reporting: only what the provider actually named.
             result.actual_model = verify_actual_model(result.raw_response, task.assigned_model)
@@ -345,13 +516,14 @@ class SwarmWorkerPool:
                     "provider": adapter.provider,
                     "actual_model": result.actual_model,
                     "exit_code": result.exit_code,
+                    "sandboxed": worktree_record is not None,
                 },
             )
 
             if result.success:
-                self._on_success(task, adapter, agent_id, session_id, result, memory_refs)
+                self._on_success(task, adapter, agent_id, session_id, result, memory_refs, worktree_record)
             else:
-                self._on_failure(task, adapter, agent_id, session_id, result)
+                self._on_failure(task, adapter, agent_id, session_id, result, worktree_record)
 
             return result
         finally:
@@ -372,6 +544,7 @@ class SwarmWorkerPool:
         session_id: str,
         result: TaskExecutionResult,
         memory_refs: list[str],
+        worktree_record: WorktreeRecord | None = None,
     ) -> None:
         # Shared memory: one compact, useful entry. Never the raw payload.
         stored_refs = list(memory_refs)
@@ -398,14 +571,21 @@ class SwarmWorkerPool:
                 metadata={"memory_id": entry.memory_id, "scope": MemoryScope.PROJECT.value},
             )
 
-        git_state = self._git_state()
+        git_state = (
+            f"Isolated sandbox on branch {worktree_record.branch} ({len(result.files_touched)} files modified)"
+            if (worktree_record and result.files_touched)
+            else self._git_state()
+        )
         recommended_agent = (
             VERIFICATION_AGENT if agent_id != VERIFICATION_AGENT else "antigravity-account-1"
         )
 
-        next_action = (
-            f"Verify the output of task {task.task_id} ('{task.title}') and integrate it."
-        )
+        if worktree_record and result.files_touched:
+            next_action = f"Review diff for task {task.task_id} on branch {worktree_record.branch} and approve/apply changes."
+        else:
+            next_action = (
+                f"Verify the output of task {task.task_id} ('{task.title}') and integrate it."
+            )
         if result.conversation_id:
             next_action += (
                 f" Resume the originating conversation with "
@@ -457,6 +637,18 @@ class SwarmWorkerPool:
             memory_refs=stored_refs,
         )
 
+        self._event_bus.publish(
+            EventType.TASK_EXECUTION_COMPLETED,
+            agent_id=agent_id,
+            task_id=task.task_id,
+            session_id=session_id,
+            metadata={
+                "exit_code": result.exit_code,
+                "files_touched": result.files_touched,
+                "sandboxed": worktree_record is not None,
+            },
+        )
+
         self._emit(
             "completed",
             EventType.TASK_COMPLETED,
@@ -489,7 +681,13 @@ class SwarmWorkerPool:
         agent_id: str,
         session_id: str,
         result: TaskExecutionResult,
+        worktree_record: WorktreeRecord | None = None,
     ) -> None:
+        if worktree_record:
+            worktree_record.status = WorktreeStatus.FAILED
+            worktree_record.error = result.error or f"exit {result.exit_code}"
+            self._worktree_manager._save_registry()
+
         self._task_manager.update_status(
             task.task_id,
             TaskStatus.FAILED,
@@ -501,9 +699,23 @@ class SwarmWorkerPool:
             conversation_id=result.conversation_id,
             duration_seconds=result.duration_seconds,
         )
+
+        self._event_bus.publish(
+            EventType.TASK_EXECUTION_FAILED,
+            agent_id=agent_id,
+            task_id=task.task_id,
+            session_id=session_id,
+            metadata={
+                "error": (result.error or "")[:500],
+                "exit_code": result.exit_code,
+                "sandboxed": worktree_record is not None,
+            },
+        )
+
         self._emit(
             "failed",
             EventType.TASK_FAILED,
+
             adapter,
             agent_id,
             task.task_id,

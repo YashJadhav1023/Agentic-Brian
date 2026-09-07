@@ -30,7 +30,12 @@ runtime/cache/*
 !runtime/cache/.gitkeep
 runtime/temporary/*
 !runtime/temporary/.gitkeep
-locks/*
+runtime/sandboxes/*
+!runtime/sandboxes/.gitkeep
+runtime/*.token
+*.token
+locks/*.lock
+locks/*.json
 !locks/.gitkeep
 sessions/*.json
 !sessions/.gitkeep

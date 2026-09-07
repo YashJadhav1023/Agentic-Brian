@@ -192,6 +192,113 @@ def cmd_sessions(args: argparse.Namespace) -> None:
         )
 
 
+def cmd_worktree(args: argparse.Namespace) -> None:
+    orch = Orchestrator(workspace_dir=PROJECT_ROOT)
+    wt_mgr = orch.worktrees
+
+    if args.subcommand == "status":
+        records = wt_mgr.status(args.task_id)
+        if args.json:
+            if isinstance(records, list):
+                print(json.dumps([r.to_dict() for r in records], indent=2))
+            elif records:
+                print(json.dumps(records.to_dict(), indent=2))
+            else:
+                print("[]")
+            return
+
+        if isinstance(records, list):
+            print(f"\n=== Worktree Sandboxes ({len(records)} total) ===")
+            if not records:
+                print("No active sandboxes.")
+            for r in records:
+                files_str = f"({len(r.files_changed)} files: {', '.join(r.files_changed[:3])}{'...' if len(r.files_changed)>3 else ''})" if r.files_changed else "(no files modified)"
+                print(
+                    f"- [{r.status.value:<14}] {r.task_id}\n"
+                    f"    branch: {r.branch} | agent: {r.agent_id} ({r.account_id})\n"
+                    f"    path:   {r.path}\n"
+                    f"    stats:  +{r.insertions}/-{r.deletions} {files_str}"
+                )
+        elif records:
+            r = records
+            print(f"\n=== Worktree Sandbox: {r.task_id} ===")
+            print(f"  Status:       {r.status.value}")
+            print(f"  Branch:       {r.branch}")
+            print(f"  Path:         {r.path}")
+            print(f"  Agent:        {r.agent_id} (account: {r.account_id})")
+            print(f"  Base commit:  {r.base_commit}")
+            print(f"  Latest commit:{r.latest_commit or 'none'}")
+            print(f"  Diff stat:    +{r.insertions} / -{r.deletions}")
+            if r.files_changed:
+                print(f"  Files:        {', '.join(r.files_changed)}")
+        else:
+            print(f"Worktree for task '{args.task_id}' not found.")
+
+    elif args.subcommand == "diff":
+        try:
+            diff_data = wt_mgr.diff(args.task_id)
+            if args.json:
+                print(json.dumps(diff_data, indent=2))
+            else:
+                print(f"\n=== Diff for task: {args.task_id} ({diff_data['branch']}) ===")
+                print(f"Base commit: {diff_data['base_commit']}")
+                if diff_data['diff_stat']:
+                    print(f"Stat:\n{diff_data['diff_stat']}\n")
+                if diff_data['diff']:
+                    print(diff_data['diff'])
+                else:
+                    print("(No diff content)")
+        except Exception as exc:
+            print(f"Error getting diff: {exc}")
+            sys.exit(1)
+
+    elif args.subcommand == "approve":
+        if not args.confirm:
+            print(f"Error: Approval merges the sandbox branch into the canonical repository.")
+            print(f"Re-run with '--confirm' to apply: python3 scripts/brain.py worktree approve {args.task_id} --confirm")
+            sys.exit(1)
+        try:
+            res = wt_mgr.apply(task_id=args.task_id, approver=args.approver or "cli_user", confirm=True)
+            print(f"Successfully applied sandbox changes for task {args.task_id}:")
+            print(f"  Commit: {res.get('commit')}")
+            print(f"  Branch: {res.get('branch')}")
+            print(f"  Stat:   {res.get('diffstat')}")
+        except Exception as exc:
+            print(f"Failed to apply sandbox changes: {exc}")
+            sys.exit(1)
+
+    elif args.subcommand == "reject":
+        if not args.confirm:
+            print(f"Error: Rejection permanently removes the sandbox worktree and deletes its branch.")
+            print(f"Re-run with '--confirm' to reject: python3 scripts/brain.py worktree reject {args.task_id} --confirm")
+            sys.exit(1)
+        try:
+            res = wt_mgr.reject(task_id=args.task_id, confirm=True)
+            print(f"Successfully rejected and destroyed sandbox for task {args.task_id}:")
+            print(f"  Cleaned: {res.get('cleaned')}")
+        except Exception as exc:
+            print(f"Failed to reject sandbox: {exc}")
+            sys.exit(1)
+
+    elif args.subcommand == "recover":
+        try:
+            record = wt_mgr.recover(task_id=args.task_id)
+            print(f"Recovered worktree for task {args.task_id}:")
+            print(f"  Branch: {record.branch}")
+            print(f"  Status: {record.status.value}")
+        except Exception as exc:
+            print(f"Failed to recover sandbox: {exc}")
+            sys.exit(1)
+
+    elif args.subcommand == "cleanup":
+        if not args.confirm:
+            print(f"Error: Bulk cleanup removes stale sandbox worktrees.")
+            print(f"Re-run with '--confirm' to cleanup: python3 scripts/brain.py worktree cleanup --confirm")
+            sys.exit(1)
+        cleaned = wt_mgr.cleanup(max_age_hours=args.max_age_hours)
+        print(f"Cleaned up {len(cleaned)} stale worktree sandboxes.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Agentic Brain Multi-Agent Orchestrator CLI")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -235,6 +342,33 @@ def main() -> None:
     p_sessions = sub.add_parser("sessions", help="Show task/session/conversation mapping")
     p_sessions.add_argument("--limit", type=int, default=20)
 
+    p_wt = sub.add_parser("worktree", help="Manage isolated git worktree sandboxes")
+    p_wt_sub = p_wt.add_subparsers(dest="subcommand", required=True)
+
+    p_wt_status = p_wt_sub.add_parser("status", help="Show worktree status")
+    p_wt_status.add_argument("task_id", nargs="?", help="Specific task ID (optional)")
+    p_wt_status.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    p_wt_diff = p_wt_sub.add_parser("diff", help="Show diff of worktree sandbox")
+    p_wt_diff.add_argument("task_id", help="Task ID")
+    p_wt_diff.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    p_wt_approve = p_wt_sub.add_parser("approve", help="Approve and apply worktree changes into canonical repo")
+    p_wt_approve.add_argument("task_id", help="Task ID")
+    p_wt_approve.add_argument("--approver", default="cli_user", help="Name or identity of approver")
+    p_wt_approve.add_argument("--confirm", action="store_true", help="Confirm merging changes into canonical repo")
+
+    p_wt_reject = p_wt_sub.add_parser("reject", help="Reject and destroy worktree sandbox")
+    p_wt_reject.add_argument("task_id", help="Task ID")
+    p_wt_reject.add_argument("--confirm", action="store_true", help="Confirm destroying worktree sandbox")
+
+    p_wt_recover = p_wt_sub.add_parser("recover", help="Recover an existing worktree branch into registry")
+    p_wt_recover.add_argument("task_id", help="Task ID")
+
+    p_wt_cleanup = p_wt_sub.add_parser("cleanup", help="Cleanup stale worktrees")
+    p_wt_cleanup.add_argument("--max-age-hours", type=int, default=24, help="Max age in hours (default 24)")
+    p_wt_cleanup.add_argument("--confirm", action="store_true", help="Confirm cleanup")
+
     args = parser.parse_args()
     handlers = {
         "agents": cmd_agents,
@@ -246,6 +380,7 @@ def main() -> None:
         "continue": cmd_continue,
         "status": cmd_status,
         "sessions": cmd_sessions,
+        "worktree": cmd_worktree,
     }
     handlers[args.command](args)
 

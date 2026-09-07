@@ -1,88 +1,117 @@
 # Operations Runbook
 
-Project root: `~/YashDevops/Agentic_shared_memory/`. Run everything from there.
+Project root: `~/YashDevops/Agentic_shared_memory/`. Run all commands from this directory.
 
-## Daily checks
+---
+
+## 1. Daily Health & Verification Checks
 
 ```bash
-python3 scripts/brain.py agents                  # fleet, profiles, capabilities
-python3 scripts/brain.py health                  # shallow, no network
-python3 scripts/brain.py health --deep           # session probe per account
-python3 scripts/brain.py status                  # recent tasks
-python3 scripts/brain.py sessions                # conversation mapping
-python3 -m unittest discover -s tests            # 87 tests
+python3 scripts/brain.py agents                  # Fleet, profiles, execution modes, and capabilities
+python3 scripts/brain.py health                  # Shallow check (binary, profiles, permissions)
+python3 scripts/brain.py health --deep           # Deep health probe per account (zero-cost model listing)
+python3 scripts/brain.py status                  # Recent tasks and execution states
+python3 scripts/brain.py sessions                # Task -> session -> conversation mapping
+python3 scripts/brain.py worktree status         # List active isolated git worktree sandboxes
+python3 -m unittest discover -s tests            # Run full test suite (116 passing tests)
 ```
 
-`health` exits `1` if any agent is unhealthy, so it works in a cron or a
-pre-flight check.
+`health` exits with code `0` when all agents are healthy, or `1` if any agent is degraded or unhealthy.
 
-Shallow health = binary resolvable, profile exists, readable and writable.
-Deep health = `agy --app_data_dir=<profile> models`, which proves the session is
-usable **without spending a model request**. Deep results are cached for 300 s.
+---
 
-## Running work
+## 2. Running Work
 
 ```bash
-# let the brain choose the agent
+# 1. Let the Smart Router choose the optimal agent automatically
 python3 scripts/brain.py plan "Review and refactor this service"
 python3 scripts/brain.py execute
 
-# pin the agent and model
-python3 scripts/brain.py plan "Refactor telemetry" \
-  --agent antigravity-account-2 --model gemini-3.1-pro-high
+# 2. Pin an explicit agent and model
+python3 scripts/brain.py plan "Refactor telemetry helpers" \
+  --agent antigravity-account-2 --model gemini-3.8-flash-medium
 python3 scripts/brain.py execute
 
-# a task that needs to read files (opt-in tool escalation)
-python3 scripts/brain.py plan "Audit the retry logic" --allow-tool-permissions
+# 3. Mutating task with explicit tool permission escalation
+python3 scripts/brain.py plan "Create module tests" \
+  --file tests/unit/test_module.py --allow-tool-permissions
 python3 scripts/brain.py execute
 
-# resume
+# 4. Universal Continue (resumes from task + session + handoff + memory)
 python3 scripts/brain.py continue --dry-run
 python3 scripts/brain.py continue
 ```
 
-`execute` runs at most `MAX_CONCURRENT_AGENTS` (2) tasks per invocation. Run it
-again to drain the rest of the queue.
+`execute` processes at most `MAX_CONCURRENT_AGENTS` (2) tasks per invocation to respect hardware boundaries.
 
-## Resource envelope
+---
 
-Host: CachyOS, Intel i7, 2 cores, 16 GB. Bounded concurrency is 2, set in
-`config/providers.json` under `concurrency` and overridable:
+## 3. Git Worktree Sandbox Management
 
-```bash
-MAX_CONCURRENT_AGENTS=1 python3 scripts/brain.py execute
-```
-
-Do not raise it above 2 on this host. There are no daemons, no containers and no
-database server; state is files on disk.
-
-## Recovery
+When an agent executes a mutating task, changes are quarantined inside `runtime/sandboxes/agentic-task-<task_id>`. Use the `worktree` subcommands to inspect and manage them:
 
 ```bash
-# return interrupted RUNNING tasks to the queue after a crash or reboot
-python3 -c "from tasks.manager import TaskManager; print(TaskManager().recover_orphaned_tasks())"
+# View all sandbox sandboxes and their status
+python3 scripts/brain.py worktree status
 
-# clear a stale file lock (locks carry a TTL and self-reclaim)
-ls locks/
+# View unified diff for a specific task sandbox
+python3 scripts/brain.py worktree diff <task_id>
+
+# Approve and merge sandbox branch into canonical repository (requires --confirm)
+python3 scripts/brain.py worktree approve <task_id> --confirm
+
+# Reject and destroy sandbox worktree and delete its branch (requires --confirm)
+python3 scripts/brain.py worktree reject <task_id> --confirm
+
+# Recover an existing branch into the active registry
+python3 scripts/brain.py worktree recover <task_id>
+
+# Prune stale worktrees older than 24 hours
+python3 scripts/brain.py worktree cleanup --confirm --max-age-hours 24
 ```
 
-## State locations
+---
 
-| What | Where | Tracked in git |
-|---|---|---|
-| Tasks | `tasks/{queue,active,completed,failed}/*.json` | no (ephemeral) |
-| Sessions | `sessions/session_registry.json` | no |
-| Memory | `memory/store/shared_memory.db` | no |
-| Events | `runtime/logs/events.jsonl` | no |
-| Handoffs | `handoffs/current.{md,json}` + `archive/` | current only |
-| Config | `config/providers.json` | yes |
+## 4. Mission Control Operations
 
-## Mission Control
-
+### Starting the Server
 ```bash
-python3 ui/dashboard/dashboard.py        # 127.0.0.1:3333
-BRAIN_PORT=4444 python3 ui/dashboard/dashboard.py
+python3 ui/dashboard/dashboard.py                 # Default: 127.0.0.1:3333
+BRAIN_PORT=4444 python3 ui/dashboard/dashboard.py  # Custom port
 ```
 
-Loopback only. Its POST endpoints are unauthenticated — see `docs/UI.md` before
-changing the bind address.
+### Security & Authentication
+Mission Control is strictly bound to `127.0.0.1`.
+All mutating endpoints (`/api/dispatch`, `/api/continue`, `/api/worktrees/*`) require Bearer token authentication:
+- The token is retrieved from `MISSION_CONTROL_AUTH_TOKEN` env var or `runtime/mission_control.token`.
+- To query or test authenticated endpoints via `curl`:
+  ```bash
+  TOKEN=$(cat runtime/mission_control.token)
+
+  # Dispatch a task
+  curl -X POST http://127.0.0.1:3333/api/dispatch \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"instruction": "Run code audit"}'
+
+  # Approve a worktree merge
+  curl -X POST http://127.0.0.1:3333/api/worktrees/approve \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"task_id": "task-xxxx", "confirm": true}'
+  ```
+
+---
+
+## 5. State & Directory Layout
+
+| Entity | Storage Path | Tracked in Git | Description |
+|---|---|---|---|
+| Tasks | `tasks/{queue,active,completed,failed}/*.json` | No | Task records and status lifecycle |
+| Sessions | `sessions/session_registry.json` | No | Agent-to-conversation session mapping |
+| Worktrees | `runtime/sandboxes/` | No | Isolated git worktrees and metadata |
+| Tokens | `runtime/mission_control.token` | No | Cryptographic bearer auth token |
+| Memory | `memory/store/shared_memory.db` | No | SQLite cross-agent memory store |
+| Logs/Events | `runtime/logs/events.jsonl` | No | Structured append-only audit bus |
+| Handoffs | `handoffs/current.{md,json}` + `archive/` | Current only | Live baton and historical checkpoints |
+| Config | `config/providers.json` | Yes | Agent, model, and concurrency config |
