@@ -370,7 +370,8 @@ def main() -> None:
 
     p_wt_cleanup = p_wt_sub.add_parser("cleanup", help="Cleanup stale worktrees")
     p_wt_cleanup.add_argument("--max-age-hours", type=int, default=24, help="Max age in hours (default 24)")
-    p_wt_cleanup.add_argument("--confirm", action="store_true", help="Confirm cleanup")
+    p_bench = sub.add_parser("benchmark", help="Run master optimization benchmark suite (Tests A-G)")
+    p_bench.add_argument("--json", action="store_true", help="Emit JSON output")
 
     args = parser.parse_args()
     handlers = {
@@ -384,8 +385,22 @@ def main() -> None:
         "status": cmd_status,
         "sessions": cmd_sessions,
         "worktree": cmd_worktree,
+        "benchmark": lambda a: _run_benchmark(a),
     }
     handlers[args.command](args)
+
+
+def _run_benchmark(args: argparse.Namespace) -> None:
+    from dataclasses import asdict
+    from scripts.benchmark import MasterBenchmarkSuite, print_table
+    suite = MasterBenchmarkSuite(workspace_dir=PROJECT_ROOT)
+    results = suite.run_all()
+    if getattr(args, "json", False):
+        print(json.dumps([asdict(r) for r in results], indent=2))
+    else:
+        print_table(results)
+    if not all(r.success for r in results):
+        sys.exit(1)
 
 
 if __name__ == "__main__":
