@@ -463,6 +463,8 @@ class AntigravityAccountAdapter(AgentAdapter):
             argv.append(f"--mode={opts['mode']}")
         if opts.get("effort") in ("low", "medium", "high"):
             argv.append(f"--effort={opts['effort']}")
+        if opts.get("disable_slash_commands"):
+            argv.append("--disable-slash-commands")
         argv.extend(["-p", prompt])
 
         self._current_status = AgentStatus.WORKING
