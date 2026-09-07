@@ -5,6 +5,7 @@ Combines keyword matching, tag overlap, and importance weighting.
 """
 from __future__ import annotations
 
+import datetime
 import re
 import sqlite3
 from typing import Any
@@ -33,6 +34,15 @@ class MemoryRetriever:
 
         tokens = set(re.findall(r"\w{3,}", query.lower()))
 
+        now = datetime.datetime.now(datetime.timezone.utc)
+        SCOPE_WEIGHTS = {
+            MemoryScope.TASK: 5.0,
+            MemoryScope.SESSION: 4.0,
+            MemoryScope.PROJECT: 2.0,
+            MemoryScope.GLOBAL: 1.0,
+            MemoryScope.AGENT: 1.5,
+        }
+
         scored: list[tuple[float, MemoryEntry]] = []
         for mem in all_memories:
             # Filter scope if requested
@@ -40,6 +50,9 @@ class MemoryRetriever:
                 continue
 
             score = float(mem.importance)
+
+            # Scope hierarchy weight
+            score += SCOPE_WEIGHTS.get(mem.scope, 1.0)
 
             # Exact task match bonus
             if task_id and mem.task_id == task_id:
@@ -54,6 +67,17 @@ class MemoryRetriever:
             for tag in mem.tags:
                 if tag.lower() in tokens:
                     score += 3.0
+
+            # Recency decay: newer memories get higher freshness multiplier
+            try:
+                mem_time = datetime.datetime.fromisoformat(mem.timestamp)
+                if mem_time.tzinfo is None:
+                    mem_time = mem_time.replace(tzinfo=datetime.timezone.utc)
+                age_hours = max(0.0, (now - mem_time).total_seconds() / 3600.0)
+                recency_multiplier = max(0.5, 1.5 - min(1.0, age_hours / 72.0))
+                score *= recency_multiplier
+            except Exception:
+                pass
 
             scored.append((score, mem))
 

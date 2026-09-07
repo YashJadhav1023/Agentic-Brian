@@ -96,6 +96,24 @@ class HandoffRecord:
         lines.extend(["", "## Next Action", self.next_action or "None"])
         return "\n".join(lines)
 
+    def compress_for_prompt(self, max_chars: int = 2000) -> str:
+        """Produce a concise, token-efficient handoff block for model context."""
+        lines = [
+            f"### Prior Task Handoff: {self.task}",
+            f"- Objective: {self.objective[:200]}",
+            f"- Completed: {'; '.join(self.completed[:3]) if self.completed else 'None'}",
+        ]
+        if self.files_modified:
+            lines.append(f"- Files Modified: {', '.join(self.files_modified[:5])}")
+        if self.remaining_work:
+            lines.append(f"- Remaining Work: {'; '.join(self.remaining_work[:3])}")
+        if self.next_action:
+            lines.append(f"- Next Action: {self.next_action[:300]}")
+        raw = "\n".join(lines)
+        if len(raw) > max_chars:
+            raw = raw[:max_chars].rstrip() + "..."
+        return raw
+
 
 class HandoffManager:
     """Manages reading, writing and archiving handoff records."""
@@ -136,6 +154,16 @@ class HandoffManager:
             )
         except Exception:
             return None
+
+    def get_compressed_handoff(self, max_chars: int = 2000) -> str:
+        """Retrieve token-bounded handoff context for prompt assembly."""
+        record = self.get_current_record()
+        if record:
+            return record.compress_for_prompt(max_chars=max_chars)
+        raw = self.get_current_handoff()
+        if not raw:
+            return ""
+        return raw[:max_chars].rstrip() + ("..." if len(raw) > max_chars else "")
 
     def list_archive(self, limit: int = 20) -> list[Path]:
         files = sorted(
