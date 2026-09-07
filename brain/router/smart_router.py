@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from agents.base.adapter import AgentAdapter, AgentStatus, Capability
@@ -70,6 +71,10 @@ CAPABILITY_KEYWORDS: tuple[tuple[Capability, re.Pattern[str]], ...] = (
 KEYWORD_AFFINITY_WEIGHT = 10.0
 CAPABILITY_WEIGHT = 4.0
 STRENGTH_FIT_WEIGHT = 3.0
+RELIABILITY_WEIGHT = 4.0
+LATENCY_WEIGHT = 2.0
+TOKEN_EFFICIENCY_WEIGHT = 2.0
+HEALTH_WEIGHT = 2.0
 LOAD_PENALTY = 6.0
 
 COMPLEXITY_TARGET_STRENGTH = {
@@ -88,6 +93,7 @@ class CandidateScore:
     score: float
     matched_capabilities: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
+    score_breakdown: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -97,6 +103,7 @@ class CandidateScore:
             "score": round(self.score, 2),
             "matched_capabilities": self.matched_capabilities,
             "reasons": self.reasons,
+            "score_breakdown": {k: round(v, 2) for k, v in self.score_breakdown.items()},
         }
 
 
@@ -115,22 +122,63 @@ class RoutingDecision:
 
 
 class SmartRouter:
-    """Capability-aware task routing across all registered agents."""
+    """Capability-aware, multi-factor task routing across all registered agents."""
 
-    def __init__(self, registry: ProviderRegistry, task_manager: Any | None = None) -> None:
+    def __init__(
+        self,
+        registry: ProviderRegistry,
+        task_manager: Any | None = None,
+        history_file: Path | None = None,
+        telemetry_tracker: Any | None = None,
+    ) -> None:
         self._registry = registry
         self._task_manager = task_manager
+        self._history_file = history_file or (Path(__file__).resolve().parent.parent.parent / "runtime" / "logs" / "routing_history.jsonl")
+        self._telemetry_tracker = telemetry_tracker
+
+    def _get_agent_metrics(self, agent_id: str) -> dict[str, Any]:
+        if self._telemetry_tracker:
+            metrics = self._telemetry_tracker.get_metrics()
+            agent_data = metrics.get("by_agent", {}).get(agent_id, {})
+            if agent_data:
+                return agent_data
+
+        # Fallback to TaskManager inspection if tracker not provided
+        if self._task_manager:
+            try:
+                tasks = [t for t in self._task_manager.list_tasks() if t.assigned_agent == agent_id]
+                if tasks:
+                    completed = sum(1 for t in tasks if t.status.value in ("COMPLETED", "VERIFICATION_COMPLETE"))
+                    return {
+                        "tasks": len(tasks),
+                        "success_rate": completed / len(tasks),
+                        "avg_duration": 15.0,
+                        "avg_tokens": 10000,
+                    }
+            except Exception:
+                pass
+
+        return {"tasks": 0, "success_rate": 1.0, "avg_duration": 10.0, "avg_tokens": 5000}
 
     # ------------------------------------------------------------------
     # Analysis
     # ------------------------------------------------------------------
     def infer_complexity(self, text: str) -> Complexity:
         lower = text.lower()
-        if any(w in lower for w in ("deep reasoning", "formal proof", "mission critical", "high risk", "complex rfc")):
+        if any(w in lower for w in (
+            "deep reasoning", "formal proof", "mission critical", "high risk", "complex rfc",
+            "architect", "consensus", "byzantine", "formal verification", "cryptographic",
+            "distributed protocol", "fault tolerance"
+        )):
             return Complexity.REASONING
-        if any(w in lower for w in ("refactor all", "restructure", "comprehensive", "full audit", "major rewrite", "across every")):
+        if any(w in lower for w in (
+            "refactor all", "restructure", "comprehensive", "full audit", "major rewrite",
+            "across every", "multi-region", "migration"
+        )):
             return Complexity.STRONG
-        if any(w in lower for w in ("quick fix", "typo", "lint", "comment", "format", "minor tweak", "sanity")):
+        if any(w in lower for w in (
+            "quick fix", "typo", "lint", "comment", "format", "minor tweak", "sanity", "fix typo"
+        )):
             return Complexity.FAST
         return Complexity.STANDARD
 
@@ -151,13 +199,14 @@ class SmartRouter:
     def score_candidates(
         self, task_text: str, complexity: Complexity | None = None
     ) -> list[CandidateScore]:
-        """Score every healthy agent against the task. Highest score wins."""
+        """Score every healthy agent against the task with multi-factor weighting."""
         complexity = complexity or self.infer_complexity(task_text)
         required = self.infer_capabilities(task_text)
         target_strength = COMPLEXITY_TARGET_STRENGTH.get(complexity, 3)
 
         scores: list[CandidateScore] = []
         for adapter in self._registry.list_active_adapters():
+            breakdown: dict[str, float] = {}
             candidate = CandidateScore(
                 agent_id=adapter.agent_id,
                 account_id=adapter.account_id,
@@ -165,36 +214,74 @@ class SmartRouter:
                 score=0.0,
             )
 
+            # 1. Keyword Affinity
+            kw_score = 0.0
             for agent_id, pattern, explanation in AGENT_KEYWORDS:
                 if agent_id == adapter.agent_id and pattern.search(task_text):
-                    candidate.score += KEYWORD_AFFINITY_WEIGHT
+                    kw_score += KEYWORD_AFFINITY_WEIGHT
                     candidate.reasons.append(f"keyword affinity: {explanation}")
                     break
+            breakdown["keyword_affinity"] = kw_score
 
+            # 2. Capability Overlap
             declared = adapter.capabilities()
             overlap = required & declared
+            cap_score = 0.0
             if overlap:
-                candidate.score += CAPABILITY_WEIGHT * len(overlap)
+                cap_score = CAPABILITY_WEIGHT * len(overlap)
                 candidate.matched_capabilities = sorted(c.value for c in overlap)
                 candidate.reasons.append(
                     f"{len(overlap)}/{len(required)} required capabilities declared"
                 )
+            breakdown["capability_match"] = cap_score
 
+            # 3. Model Strength Fit
             reachable = self._max_strength(adapter.agent_id)
+            strength_score = 0.0
             if reachable >= target_strength:
-                candidate.score += STRENGTH_FIT_WEIGHT
+                strength_score = STRENGTH_FIT_WEIGHT
                 candidate.reasons.append(
-                    f"model catalogue reaches strength {reachable} (needs {target_strength})"
+                    f"model strength {reachable} >= required {target_strength}"
                 )
             else:
                 candidate.reasons.append(
-                    f"model catalogue tops out at strength {reachable}, below {target_strength}"
+                    f"model strength {reachable} < required {target_strength}"
                 )
+            breakdown["strength_fit"] = strength_score
 
+            # 4. Reliability / Historical Success Rate
+            metrics = self._get_agent_metrics(adapter.agent_id)
+            succ_rate = metrics.get("success_rate", 1.0)
+            rel_score = RELIABILITY_WEIGHT * succ_rate
+            breakdown["reliability"] = rel_score
+            if metrics.get("tasks", 0) > 0:
+                candidate.reasons.append(f"reliability: {succ_rate*100:.0f}% success")
+
+            # 5. Latency Score
+            avg_duration = metrics.get("avg_duration", 15.0)
+            lat_score = max(0.0, LATENCY_WEIGHT * (1.0 - min(avg_duration / 60.0, 1.0)))
+            breakdown["latency"] = lat_score
+
+            # 6. Token Efficiency Score
+            avg_tokens = metrics.get("avg_tokens", 10000)
+            tok_score = max(0.0, TOKEN_EFFICIENCY_WEIGHT * (1.0 - min(avg_tokens / 100000.0, 1.0)))
+            breakdown["token_efficiency"] = tok_score
+
+            # 7. Health Bonus
+            healthy, _ = adapter.health()
+            hlth_score = HEALTH_WEIGHT if healthy else 0.0
+            breakdown["health"] = hlth_score
+
+            # 8. Load Penalty
+            load_pen = 0.0
             if self._busy(adapter):
-                candidate.score -= LOAD_PENALTY
+                load_pen = LOAD_PENALTY
                 candidate.reasons.append("currently WORKING; deprioritized")
+            breakdown["load_penalty"] = -load_pen
 
+            # Sum total score
+            candidate.score = sum(breakdown.values())
+            candidate.score_breakdown = breakdown
             scores.append(candidate)
 
         scores.sort(key=lambda c: c.score, reverse=True)
@@ -233,7 +320,7 @@ class SmartRouter:
                 c for c in self.score_candidates(task_text, complexity)
                 if c.agent_id != adapter.agent_id
             ]
-            return RoutingDecision(
+            decision = RoutingDecision(
                 agent_id=adapter.agent_id,
                 account_id=adapter.account_id,
                 provider=adapter.provider,
@@ -248,6 +335,8 @@ class SmartRouter:
                 required_capabilities=required,
                 candidates=[c.to_dict() for c in fallbacks],
             )
+            self._log_decision(task_text, decision)
+            return decision
 
         # 2. Scored competition across every healthy agent.
         candidates = self.score_candidates(task_text, complexity)
@@ -260,7 +349,7 @@ class SmartRouter:
 
         reason = "; ".join(winner.reasons) if winner.reasons else "highest scoring available agent"
 
-        return RoutingDecision(
+        decision = RoutingDecision(
             agent_id=winner.agent_id,
             account_id=winner.account_id,
             provider=winner.provider,
@@ -275,3 +364,42 @@ class SmartRouter:
             required_capabilities=required,
             candidates=[c.to_dict() for c in candidates],
         )
+        self._log_decision(task_text, decision)
+        return decision
+
+    def _log_decision(self, task_text: str, decision: RoutingDecision) -> None:
+        try:
+            import datetime
+            record = {
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "task_text": task_text[:120],
+                "selected_agent": decision.agent_id,
+                "selected_account": decision.account_id,
+                "selected_model": decision.model,
+                "complexity": decision.complexity.value,
+                "reason": decision.reason,
+                "fallback_agent": decision.fallback_agent_id,
+                "candidates": decision.candidates,
+            }
+            self._history_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._history_file, "a", encoding="utf-8") as f:
+                import json
+                f.write(json.dumps(record) + "\n")
+        except Exception:
+            pass
+
+    def get_routing_history(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Retrieve recent routing history records in reverse chronological order."""
+        if not self._history_file.is_file():
+            return []
+        records: list[dict[str, Any]] = []
+        try:
+            import json
+            with open(self._history_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        records.append(json.loads(line))
+        except Exception:
+            return []
+        return list(reversed(records))[:limit]
