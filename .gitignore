@@ -1,0 +1,60 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environments & Dependencies
+.env
+.env.local
+*.env
+!.env.example
+venv/
+.venv/
+env/
+node_modules/
+
+# Secrets, Keys & Credentials
+*.key
+*.pem
+*.cert
+*.crt
+*service-account*.json
+secrets*
+creds*
+
+# Runtime data & locks (ephemeral state)
+runtime/logs/*
+!runtime/logs/.gitkeep
+runtime/cache/*
+!runtime/cache/.gitkeep
+runtime/temporary/*
+!runtime/temporary/.gitkeep
+locks/*
+!locks/.gitkeep
+sessions/*
+!sessions/.gitkeep
+events/*
+!events/.gitkeep
+
+# Ephemeral runtime databases & journals
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Local test & task execution records
+tasks/queue/*.json
+tasks/active/*.json
+tasks/completed/*.json
+tasks/failed/*.json
+handoffs/archive/*.md
+
+# Local user configs & OS caches
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
