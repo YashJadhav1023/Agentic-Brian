@@ -1,27 +1,95 @@
-# Provider Registry & Future Extensibility
+# Providers & Provider Registry
 
-## Architectural Philosophy
+## One configuration source
 
-The Agentic Shared Memory platform is designed so that the core brain orchestrator and router have zero provider-specific hard-coding. Agents register their capabilities and available models through the `ProviderRegistry`.
+`config/providers.json` is the single source of truth for providers, accounts,
+execution flags, capabilities and model catalogues. No adapter hard-codes a CLI
+flag, a profile path or a model id.
 
-## Current Provider Fleet
+```json
+{
+  "providers": {
+    "antigravity": {
+      "command": "/home/setoo/.gemini/bin/agy",
+      "profile_root": "~/.gemini",
+      "accounts": {
+        "antigravity-account-2": {
+          "agent_id": "antigravity-account-2",
+          "account_id": "account-2",
+          "execution": {
+            "app_data_dir": "antigravity-ide",
+            "output_format": "json",
+            "dangerously_skip_permissions": false
+          },
+          "capabilities": ["component-refactoring", "code-review", "..."],
+          "models": ["gemini-3.1-pro-high", "..."],
+          "default_model": "gemini-3.8-flash-medium"
+        }
+      }
+    }
+  }
+}
+```
 
-Currently, the active execution pool is strictly:
-1. `Google Antigravity` (Account 1 & Account 2)
-2. `Kiro` (CLI)
-3. `Cline` (CLI)
+Loaders:
 
-*Note: In accordance with project instructions, Gemini API is excluded from the active pool.*
+- `providers/registry/config.py` — provider-neutral read-only views
+  (`get_accounts`, `get_account`, `max_concurrent_agents`).
+- `agents/antigravity/adapter.py` — `AntigravityAdapter.load_from_config()`
+  builds one adapter per enabled account.
+- `providers/registry/bootstrap.py` — assembles the whole registry from config.
 
-## Adding a Future Provider (e.g. Gemini API, OpenAI API, Anthropic API)
+Setting `"enabled": false` on a provider or an account removes it from the
+registry, the router and the UI. No code change.
 
-To add a new provider without modifying any core brain logic:
-1. Implement the `AgentAdapter` interface in `providers/adapters/<new_provider>.py`.
-2. Configure credentials via environment variables (e.g., in `.env` or system keyring).
-3. Register the adapter in `providers/registry/bootstrap.py`:
-   ```python
-   new_provider = Provider(id="openai", name="OpenAI", description="OpenAI API")
-   new_provider.add_adapter(OpenAIAdapter())
-   registry.register_provider(new_provider)
-   ```
-4. The Smart Router, Swarm Worker Pool, and Mission Control UI will automatically discover the new provider, display its health, and route tasks to it.
+## Registry
+
+`ProviderRegistry` holds providers, each holding adapters keyed by `agent_id`.
+
+```
+ProviderRegistry
+  register_provider / register_adapter
+  get_adapter(agent_id) / get_provider(provider_id)
+  list_providers() / list_active_adapters()   # active = enabled AND healthy
+  to_dict()                                   # Mission Control serialization
+```
+
+Each registered agent exposes: `agent_id`, `provider`, `account_id`, `profile`,
+`execution_mode`, `status`, `capabilities`, `models`, `health`, `current_task`,
+`current_conversation`.
+
+## Adding a future provider
+
+Not implemented today; the shape is fixed so the core brain never changes.
+
+```
+REGISTER -> AUTHENTICATE -> HEALTH CHECK -> DISCOVER MODELS
+  -> DISCOVER CAPABILITIES -> REGISTER AGENT -> ROUTER -> MISSION CONTROL
+```
+
+1. Add a provider entry to `config/providers.json` with accounts, capabilities
+   and models.
+2. Implement `AgentAdapter` (`execute`, `continue_session`, `health`, `cancel`,
+   plus optional `status` / `stream`). Return `TaskExecutionResult`.
+3. Register it in `providers/registry/bootstrap.py`.
+
+The router, task system, memory, handoffs, events and UI all consume
+`AgentAdapter` and `ProviderRegistry` only, so nothing else needs to change.
+
+**Gemini API is deliberately not implemented.** It is recorded in
+`future_providers` in the config as `"enabled": false`, `"status":
+"not-implemented"` so no code path can pick it up by accident.
+
+## Model catalogue honesty
+
+A model id is only offered if it has been observed from the provider:
+
+| Agent | Enumerated with | Models |
+|---|---|---|
+| `antigravity-account-1` | `agy --app_data_dir=antigravity-cli models` | 14 |
+| `antigravity-account-2` | `agy --app_data_dir=antigravity-ide models` | 14 (identical set) |
+| `kiro-cli` | `kiro-cli chat --model <invalid>` (the CLI lists valid ids in its error) | 15 |
+| `cline` | not enumerable from the CLI | `auto` only |
+
+A test asserts that every model in a routing catalogue exists in the configured
+list, so an unverified id cannot be routed to.

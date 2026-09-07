@@ -1,32 +1,19 @@
-"""Antigravity Account 1 Adapter (CLI Profile)."""
+"""Antigravity Account 1 — signed-in Google account, profile `antigravity-cli`.
+
+This class holds no execution logic and no CLI flags. It is a named handle onto
+the account entry in `config/providers.json`.
+"""
 from __future__ import annotations
 
-from agents.antigravity.base_adapter import AntigravityBaseAdapter
-from agents.base.adapter import Capability
+from pathlib import Path
+
+from agents.antigravity.adapter import AntigravityAccountAdapter, AntigravityAdapter
+
+AGENT_ID = "antigravity-account-1"
 
 
-class AntigravityAccount1Adapter(AntigravityBaseAdapter):
-    """Headless Antigravity Account 1 (CLI OAuth Session)."""
+class AntigravityAccount1Adapter(AntigravityAccountAdapter):
+    """Account 1 adapter loaded from the central provider configuration."""
 
-    def __init__(self, data_dir_name: str = "antigravity-cli") -> None:
-        super().__init__(data_dir_name=data_dir_name)
-
-    @property
-    def agent_id(self) -> str:
-        return "antigravity-account-1"
-
-    @property
-    def provider(self) -> str:
-        return "antigravity"
-
-    @property
-    def account_id(self) -> str:
-        return "account-1"
-
-    def capabilities(self) -> frozenset[Capability]:
-        return frozenset({
-            Capability.ARCHITECTURE,
-            Capability.PROTOCOL_DESIGN,
-            Capability.GOVERNANCE,
-            Capability.DEEP_REASONING,
-        })
+    def __init__(self, config_path: Path | str | None = None) -> None:
+        super().__init__(AntigravityAdapter.get_account(AGENT_ID, config_path).config)

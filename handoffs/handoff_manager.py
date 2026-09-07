@@ -1,12 +1,15 @@
 """Structured Agent-to-Agent Handoff Manager.
 
-Produces, validates, and archives standardized Picoschema markdown handoff records.
+Produces, validates and archives standardized handoff records. Each handoff is
+written twice: a human-readable Markdown file and a machine-readable JSON
+sidecar so that Universal Continue can resume structurally instead of scraping
+prose. There is exactly one handoff store — no agent keeps its own.
 """
 from __future__ import annotations
 
 import datetime
-import re
-from dataclasses import dataclass, field
+import json
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -26,68 +29,102 @@ class HandoffRecord:
     next_action: str = ""
     recommended_agent: str = "antigravity-account-1"
     recommended_model: str = "auto"
-    created_at: str = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).isoformat())
+    created_at: str = field(
+        default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).isoformat()
+    )
+    # --- Execution identity, required for session-aware continuation --------
+    task_id: str | None = None
+    agent_id: str | None = None
+    account_id: str | None = None
+    session_id: str | None = None
+    conversation_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> HandoffRecord:
+        known = {f for f in cls.__dataclass_fields__}
+        return cls(**{k: v for k, v in data.items() if k in known})
 
     def to_markdown(self) -> str:
         lines = [
             f"# Handoff: {self.task}",
             f"**Date:** {self.created_at}",
             f"**Objective:** {self.objective}",
+            f"**Task ID:** `{self.task_id or 'n/a'}`",
+            f"**Executed By:** `{self.agent_id or 'n/a'}` (account `{self.account_id or 'n/a'}`)",
+            f"**Session:** `{self.session_id or 'n/a'}`",
+            f"**Conversation:** `{self.conversation_id or 'n/a'}`",
             f"**Git State:** {self.git_state}",
             f"**Recommended Agent:** `{self.recommended_agent}`",
             f"**Recommended Model:** `{self.recommended_model}`",
             "",
             "## Completed Work",
         ]
-        for c in (self.completed or ["None reported"]):
-            lines.append(f"- {c}")
+        for item in (self.completed or ["None reported"]):
+            lines.append(f"- {item}")
 
-        lines.extend(["", "## Files Modified"])
-        for f in (self.files_modified or ["None"]):
-            lines.append(f"- {f}")
+        for heading, values in (
+            ("Files Modified", self.files_modified),
+            ("Tests Run", self.tests),
+            ("Errors Encountered", self.errors),
+            ("Decisions Made", self.decisions),
+            ("Relevant Memory", self.relevant_memory),
+            ("Remaining Work", self.remaining_work),
+        ):
+            lines.extend(["", f"## {heading}"])
+            for item in (values or ["None"]):
+                lines.append(f"- {item}")
 
-        lines.extend(["", "## Tests Run"])
-        for t in (self.tests or ["None"]):
-            lines.append(f"- {t}")
-
-        lines.extend(["", "## Errors Encountered"])
-        for e in (self.errors or ["None"]):
-            lines.append(f"- {e}")
-
-        lines.extend(["", "## Decisions Made"])
-        for d in (self.decisions or ["None"]):
-            lines.append(f"- {d}")
-
-        lines.extend(["", "## Remaining Work"])
-        for r in (self.remaining_work or ["None"]):
-            lines.append(f"- {r}")
-
-        lines.extend(["", f"## Next Action\n{self.next_action}"])
+        lines.extend(["", "## Next Action", self.next_action or "None"])
         return "\n".join(lines)
 
 
 class HandoffManager:
-    """Manages reading, writing, and archiving handoff records."""
+    """Manages reading, writing and archiving handoff records."""
 
     def __init__(self, root_dir: Path | None = None) -> None:
         self._root = root_dir or Path(__file__).resolve().parent
         self._root.mkdir(parents=True, exist_ok=True)
         self._current_file = self._root / "current.md"
+        self._current_json = self._root / "current.json"
         self._archive_dir = self._root / "archive"
         self._archive_dir.mkdir(parents=True, exist_ok=True)
 
     def write_handoff(self, record: HandoffRecord) -> Path:
-        # If current exists, archive it
+        timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
         if self._current_file.exists():
-            timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
-            archive_path = self._archive_dir / f"handoff_{timestamp}.md"
-            self._current_file.rename(archive_path)
+            self._current_file.rename(self._archive_dir / f"handoff_{timestamp}.md")
+        if self._current_json.exists():
+            self._current_json.rename(self._archive_dir / f"handoff_{timestamp}.json")
 
-        md = record.to_markdown()
-        self._current_file.write_text(md, encoding="utf-8")
+        self._current_file.write_text(record.to_markdown(), encoding="utf-8")
+        self._current_json.write_text(
+            json.dumps(record.to_dict(), indent=2), encoding="utf-8"
+        )
         return self._current_file
 
     def get_current_handoff(self) -> str | None:
         if self._current_file.exists():
             return self._current_file.read_text(encoding="utf-8")
         return None
+
+    def get_current_record(self) -> HandoffRecord | None:
+        """Structured view of the latest handoff, or None if unavailable."""
+        if not self._current_json.exists():
+            return None
+        try:
+            return HandoffRecord.from_dict(
+                json.loads(self._current_json.read_text(encoding="utf-8"))
+            )
+        except Exception:
+            return None
+
+    def list_archive(self, limit: int = 20) -> list[Path]:
+        files = sorted(
+            self._archive_dir.glob("handoff_*.md"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        return files[:limit]

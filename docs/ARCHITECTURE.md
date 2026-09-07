@@ -1,87 +1,83 @@
-# Architecture & Technical Design
+# Architecture
 
-## 1. System Overview
-
-The Agentic Shared Memory architecture is an autonomous multi-agent orchestration framework designed for local, resource-constrained environments (CachyOS Linux, Intel i7, 2 CPU cores, 16 GB RAM).
+## Execution path
 
 ```
- USER PROMPT / INSTRUCTION
-            │
-            ▼
-┌───────────────────────┐
-│     SHARED BRAIN      │
-│  Orchestrator Core    │
-└───────────┬───────────┘
-            │
-            ▼
-┌───────────────────────┐       ┌────────────────────────┐
-│     SMART ROUTER      │◀─────▶│    PROVIDER REGISTRY   │
-│  Capability & Model   │       │  Antigravity, Kiro,    │
-│  Heuristic Classifier │       │  Cline, Future APIs    │
-└───────────┬───────────┘       └────────────────────────┘
-            │
-            ▼
-┌───────────────────────┐
-│    SWARM RUNNER       │
-│  Bounded Concurrency  │
-│  Max 2 Workers        │
-└───────────┬───────────┘
-            │
-    ┌───────┴────────────────────────┬───────────────────────┐
-    ▼                                ▼                       ▼
-┌─────────────────────────┐  ┌────────────────────┐  ┌───────────────┐
-│  Antigravity Adapter    │  │    Kiro Adapter    │  │ Cline Adapter │
-│  Account 1: CLI Profile │  │    `kiro-cli`      │  │ `cline`       │
-│  Account 2: IDE Profile │  │                    │  │               │
-└───────────┬─────────────┘  └─────────┬──────────┘  └───────┬───────┘
-            │                          │                     │
-            └──────────────────────────┼─────────────────────┘
-                                       │
-                                       ▼
-                         ┌───────────────────────────┐
-                         │   FILE LOCKER & RUNTIME   │
-                         │   Task Persistence & TTL  │
-                         └─────────────┬─────────────┘
-                                       │
-                                       ▼
-                         ┌───────────────────────────┐
-                         │     OBSERVABILITY BUS     │
-                         │   Events, Memory, Handoff │
-                         └─────────────┬─────────────┘
-                                       │
-                                       ▼
-                         ┌───────────────────────────┐
-                         │    MISSION CONTROL UI     │
-                         │   Web Dashboard (:3333)   │
-                         └───────────────────────────┘
+USER
+ |
+ v
+BRAIN CLI  (scripts/brain.py)
+ |
+ v
+ORCHESTRATOR  (brain/orchestrator/orchestrator.py)
+ |
+ +--> SMART ROUTER      (brain/router/smart_router.py)      scored competition
+ |                                                          across all agents
+ +--> TASK MANAGER      (tasks/manager.py)                   persistent record
+ |
+ v
+SWARM WORKER POOL  (brain/orchestrator/swarm.py)  bounded concurrency = 2
+ |
+ +--> health pre-flight        (fail fast, never burn a run on a dead account)
+ +--> file locks               (locks/file_locker.py)
+ +--> relevant memory only     (memory/retrieval/retriever.py)
+ |
+ v
+AGENT ADAPTER  (agents/<provider>/adapter.py)
+ |
+ v
+CLI SUBPROCESS   e.g. agy --app_data_dir=antigravity-ide --output-format json -p
+ |
+ v
+STRUCTURAL JSON NORMALIZER  ->  TaskExecutionResult
+ |
+ +--> TASK RECORD      tasks/{queue,active,completed,failed}/<task-id>.json
+ +--> SESSION MAPPING  sessions/session_registry.json
+ +--> SHARED MEMORY    memory/store/shared_memory.db
+ +--> HANDOFF          handoffs/current.md + current.json
+ +--> EVENTS           runtime/logs/events.jsonl
+ |
+ v
+MISSION CONTROL  (ui/dashboard, 127.0.0.1:3333)
+ |
+ v
+NEXT AGENT  (brain.py continue)
 ```
 
-## 2. Core Subsystems
+## Layout
 
-### A. Provider & Agent Abstraction (`agents/base/` & `providers/registry/`)
-Every execution agent implements the `AgentAdapter` abstract interface:
-- `execute()`: Runs a prompt with explicit model flag and cwd isolation.
-- `continue_session()`: Continues an ongoing conversation id.
-- `health()`: Verifies local executable and data directory readiness.
-- `capabilities()`: Declares functional specializations.
-- `available_models()`: Declares locally verified model strings.
+| Path | Responsibility |
+|---|---|
+| `agents/base/adapter.py` | `AgentAdapter` contract, `Capability`, `AgentStatus`, `TaskExecutionResult`, `UNKNOWN_MODEL` |
+| `agents/antigravity/` | Provider factory + per-account adapter; `account1/`, `account2/` are named config handles |
+| `agents/kiro/`, `agents/cline/` | Single-account CLI adapters |
+| `config/providers.json` | The only configuration source |
+| `providers/registry/` | Config loader, `Provider`, `ProviderRegistry`, bootstrap |
+| `models/policies/model_policy.py` | Verified catalogues, deterministic selection, honest verification |
+| `brain/router/` | Capability-aware scored routing |
+| `brain/orchestrator/` | Orchestrator + bounded swarm pool |
+| `brain/context/continuator.py` | Universal Continue |
+| `tasks/` | Persistent task lifecycle |
+| `sessions/` | task -> session -> conversation mapping |
+| `memory/` | Shared SQLite store + relevance retrieval |
+| `handoffs/` | Markdown + JSON handoff records and archive |
+| `events/` | Append-only JSONL event bus |
+| `locks/` | Atomic file locks with TTL |
+| `ui/dashboard/` | Mission Control (loopback only) |
+| `tests/` | 87 unit and integration tests |
 
-### B. Smart Router (`brain/router/`)
-Analyzes tasks using regex pattern heuristics, required capabilities, and task complexity:
-- `antigravity-account-1`: Architecture, Governance, Strategic Design.
-- `antigravity-account-2`: Deep Refactoring, Component Architecture, Code Review.
-- `kiro-cli`: Terminal Execution, Pytest, Environment Scaffolding, DevOps.
-- `cline`: Frontend Styling, HTML/CSS, UI Components.
+## Design rules
 
-### C. Persistent Tasks (`tasks/`)
-State survives crashes, shell exits, and system reboots via atomic JSON disk serialization:
-- `tasks/queue/`: Pending ready tasks.
-- `tasks/active/`: Running tasks with start timestamps.
-- `tasks/completed/`: Completed tasks with outputs and token metrics.
-- `tasks/failed/`: Failed or blocked tasks with error logs.
-
-### D. Shared Memory (`memory/`)
-SQLite-backed scoped memory store (`GLOBAL`, `PROJECT`, `TASK`, `AGENT`, `SESSION`) with relevance-filtered contextual retrieval to keep agent prompts lean and effective.
-
-### E. Concurrency & File Safety (`locks/`)
-FileLocker prevents concurrent conflicting writes by multiple agents using atomic lockfiles with TTL expiration.
+1. **Provider-agnostic core.** Nothing above the adapter layer knows what a CLI
+   flag is. Adding a provider touches config plus one adapter.
+2. **One command builder per provider.** `--app_data_dir` appears in exactly one
+   function, which is what makes account isolation structural rather than
+   conventional.
+3. **Never fabricate.** If a provider does not report the model, the model is
+   `unknown`. If a run produces no output, it failed.
+4. **Least privilege by default.** Permission escalation is opt-in, per task or
+   per account, and is visible in the task record and the UI.
+5. **Bounded resources.** `MAX_CONCURRENT_AGENTS=2` for this 2-core / 16 GB
+   host, from config, overridable by environment.
+6. **Durable state, no daemons.** Plain JSON/JSONL/SQLite files on disk, so the
+   system survives a crash and can be inspected without running anything.

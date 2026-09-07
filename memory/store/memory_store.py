@@ -9,10 +9,11 @@ import datetime
 import json
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 class MemoryScope(str, Enum):
@@ -60,15 +61,29 @@ class MemoryEntry:
 
 
 class MemoryStore:
-    """SQLite-backed shared agent memory store."""
+    """SQLite-backed shared agent memory store.
+
+    One store is shared by every agent. No agent, including Antigravity
+    Account 2, keeps private memory.
+    """
 
     def __init__(self, db_path: Path | None = None) -> None:
         self._db_path = db_path or (Path(__file__).resolve().parent / "shared_memory.db")
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Connection that is always committed and always closed."""
+        conn = sqlite3.connect(self._db_path)
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
     def _init_db(self) -> None:
-        with sqlite3.connect(self._db_path) as conn:
+        with self._connect() as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS memories (
                     memory_id TEXT PRIMARY KEY,
@@ -86,8 +101,8 @@ class MemoryStore:
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_scope ON memories(scope)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_task ON memories(task_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_agent ON memories(source_agent)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_created ON memories(created_at)")
-            conn.commit()
 
     def add(
         self,
@@ -114,7 +129,7 @@ class MemoryStore:
             tags=tags or [],
             provenance=provenance,
         )
-        with sqlite3.connect(self._db_path) as conn:
+        with self._connect() as conn:
             conn.execute("""
                 INSERT INTO memories (
                     memory_id, content, scope, source_agent, task_id, session_id,
@@ -133,15 +148,24 @@ class MemoryStore:
                 json.dumps(entry.tags),
                 entry.provenance,
             ))
-            conn.commit()
         return entry
 
     def list_all(self, limit: int = 100) -> list[MemoryEntry]:
-        with sqlite3.connect(self._db_path) as conn:
-            cursor = conn.execute("SELECT * FROM memories ORDER BY created_at DESC LIMIT ?", (limit,))
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM memories ORDER BY created_at DESC LIMIT ?", (limit,)
+            )
+            return [MemoryEntry.from_row(r) for r in cursor.fetchall()]
+
+    def list_by_agent(self, source_agent: str, limit: int = 50) -> list[MemoryEntry]:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM memories WHERE source_agent = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (source_agent, limit),
+            )
             return [MemoryEntry.from_row(r) for r in cursor.fetchall()]
 
     def count(self) -> int:
-        with sqlite3.connect(self._db_path) as conn:
-            cursor = conn.execute("SELECT count(*) FROM memories")
-            return cursor.fetchone()[0]
+        with self._connect() as conn:
+            return conn.execute("SELECT count(*) FROM memories").fetchone()[0]

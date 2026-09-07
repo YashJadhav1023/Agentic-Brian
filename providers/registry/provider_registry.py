@@ -115,15 +115,13 @@ class ProviderRegistry:
                 "accounts": {},
             }
             for a_id, adapter in provider.adapters.items():
-                healthy, reason = adapter.health()
-                out[p_id]["accounts"][a_id] = {
-                    "agent_id": adapter.agent_id,
-                    "account_id": adapter.account_id,
-                    "provider": adapter.provider,
-                    "execution_mode": adapter.execution_mode.value,
-                    "healthy": healthy,
-                    "health_reason": reason,
-                    "capabilities": [c.value for c in adapter.capabilities()],
-                    "models": list(adapter.available_models()),
-                }
+                described = adapter.describe()
+                health = described.pop("health", {})
+                described.update(
+                    {
+                        "healthy": health.get("healthy", False),
+                        "health_reason": health.get("reason", "unknown"),
+                    }
+                )
+                out[p_id]["accounts"][a_id] = described
         return out

@@ -52,9 +52,18 @@ class AgentStatus(str, Enum):
     INTERACTIVE_ONLY = "INTERACTIVE_ONLY"
 
 
+#: Sentinel used whenever a provider does not report which model actually served a
+#: request. It is never replaced by the requested model — see docs/MODEL_ROUTING.md.
+UNKNOWN_MODEL = "unknown"
+
+
 @dataclass
 class TaskExecutionResult:
-    """Normalized output produced by an agent execution."""
+    """Normalized output produced by an agent execution.
+
+    Raw execution metadata (`raw_stdout`, `raw_stderr`, `command`, `raw_response`)
+    is deliberately preserved so no provider detail is lost by normalization.
+    """
     task_id: str
     agent_id: str
     account_id: str
@@ -72,6 +81,49 @@ class TaskExecutionResult:
     conversation_id: str | None = None
     files_touched: list[str] = field(default_factory=list)
     raw_response: dict[str, Any] = field(default_factory=dict)
+
+    # --- Extended, provider-reported execution metadata -------------------
+    session_id: str | None = None
+    #: Provider-reported terminal status string (e.g. Antigravity "SUCCESS").
+    provider_status: str | None = None
+    #: Provider-reported duration, which may differ from wall-clock duration.
+    provider_duration_seconds: float | None = None
+    num_turns: int = 0
+    thinking_tokens: int = 0
+    cache_read_tokens: int = 0
+    #: Whether the payload was valid structured JSON rather than plain text.
+    json_valid: bool = False
+    raw_stdout: str = ""
+    raw_stderr: str = ""
+    #: Argv actually executed, with the prompt redacted for log safety.
+    command: list[str] = field(default_factory=list)
+
+    def normalized(self) -> dict[str, Any]:
+        """Return the canonical cross-provider task result schema."""
+        return {
+            "agent_id": self.agent_id,
+            "account_id": self.account_id,
+            "provider": self.provider,
+            "task_id": self.task_id,
+            "session_id": self.session_id,
+            "conversation_id": self.conversation_id,
+            "requested_model": self.requested_model,
+            "actual_model": self.actual_model,
+            "response": self.output,
+            "usage": {
+                "input_tokens": self.input_tokens,
+                "output_tokens": self.output_tokens,
+                "thinking_tokens": self.thinking_tokens,
+                "cache_read_tokens": self.cache_read_tokens,
+                "total_tokens": self.total_tokens,
+            },
+            "num_turns": self.num_turns,
+            "duration_seconds": self.duration_seconds,
+            "exit_code": self.exit_code,
+            "status": "completed" if self.success else "failed",
+            "provider_status": self.provider_status,
+            "json_valid": self.json_valid,
+        }
 
 
 class AgentAdapter(abc.ABC):
@@ -147,3 +199,62 @@ class AgentAdapter(abc.ABC):
     def cancel(self, task_id: str) -> bool:
         """Attempt to cancel an in-flight execution."""
         pass
+
+    # --- Optional interface with safe defaults ----------------------------
+    # These are intentionally concrete so that adding capability to the
+    # contract never breaks an existing provider adapter.
+
+    def status(self, task_id: str | None = None) -> AgentStatus:
+        """Current lifecycle state of this agent.
+
+        Adapters that track in-flight work override this. The default is a
+        conservative IDLE for adapters with no internal state machine.
+        """
+        return AgentStatus.IDLE
+
+    def stream(
+        self,
+        task_id: str,
+        prompt: str,
+        model: str | None = None,
+        work_dir: Path | None = None,
+        timeout_seconds: int = 300,
+        options: dict[str, Any] | None = None,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+    ) -> TaskExecutionResult:
+        """Execute while emitting incremental events.
+
+        The default implementation degrades to a single terminal event so that
+        callers can always use `stream()` regardless of provider support.
+        """
+        result = self.execute(
+            task_id=task_id,
+            prompt=prompt,
+            model=model,
+            work_dir=work_dir,
+            timeout_seconds=timeout_seconds,
+            options=options,
+        )
+        if on_event:
+            on_event({"type": "result", "payload": result.normalized()})
+        return result
+
+    @property
+    def profile_dir(self) -> Path | None:
+        """Filesystem profile that isolates this account, when one exists."""
+        return None
+
+    def describe(self) -> dict[str, Any]:
+        """Registry-facing description of this execution resource."""
+        healthy, reason = self.health()
+        return {
+            "agent_id": self.agent_id,
+            "provider": self.provider,
+            "account_id": self.account_id,
+            "profile": str(self.profile_dir) if self.profile_dir else None,
+            "execution_mode": self.execution_mode.value,
+            "status": self.status().value,
+            "capabilities": sorted(c.value for c in self.capabilities()),
+            "models": list(self.available_models()),
+            "health": {"healthy": healthy, "reason": reason},
+        }

@@ -8,7 +8,7 @@ from __future__ import annotations
 import datetime
 import json
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -57,6 +57,13 @@ class Task:
     handoffs: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     result: dict[str, Any] = field(default_factory=dict)
+    #: Per-task execution overrides handed to the adapter (e.g. explicit
+    #: {"dangerously_skip_permissions": true}). Empty means "use the account's
+    #: configured least-privilege defaults".
+    execution_options: dict[str, Any] = field(default_factory=dict)
+    session_id: str | None = None
+    conversation_id: str | None = None
+    requested_model: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -66,7 +73,8 @@ class Task:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Task:
-        data = dict(d)
+        known = {f.name for f in fields(cls)}
+        data = {k: v for k, v in d.items() if k in known}
         if "status" in data:
             data["status"] = TaskStatus(data["status"])
         if "priority" in data:
@@ -160,6 +168,12 @@ class TaskManager:
         result: dict[str, Any] | None = None,
         error: str | None = None,
         actual_model: str | None = None,
+        requested_model: str | None = None,
+        session_id: str | None = None,
+        conversation_id: str | None = None,
+        duration_seconds: float | None = None,
+        handoff: str | None = None,
+        memory_refs: list[str] | None = None,
     ) -> Task | None:
         task = self.get_task(task_id)
         if not task:
@@ -175,6 +189,18 @@ class TaskManager:
 
         if actual_model:
             task.actual_model = actual_model
+        if requested_model:
+            task.requested_model = requested_model
+        if session_id:
+            task.session_id = session_id
+        if conversation_id:
+            task.conversation_id = conversation_id
+        if duration_seconds is not None:
+            task.duration_seconds = duration_seconds
+        if handoff:
+            task.handoffs.append(handoff)
+        if memory_refs:
+            task.memory_refs.extend(memory_refs)
         if result:
             task.result.update(result)
         if error:
@@ -184,15 +210,27 @@ class TaskManager:
         return task
 
     def list_tasks(self, status: TaskStatus | None = None) -> list[Task]:
-        dirs = [self._dir_for_status(status)] if status else [self._dir_queue, self._dir_active, self._dir_completed, self._dir_failed]
+        """List tasks, newest first.
+
+        Several statuses share a directory (BLOCKED, FAILED and CANCELLED all
+        live in `failed/`), so the status filter is applied to the task record
+        itself rather than inferred from its location.
+        """
+        dirs = (
+            [self._dir_for_status(status)]
+            if status
+            else [self._dir_queue, self._dir_active, self._dir_completed, self._dir_failed]
+        )
         tasks = []
         for d in dirs:
             for p in d.glob("*.json"):
                 try:
-                    data = json.loads(p.read_text(encoding="utf-8"))
-                    tasks.append(Task.from_dict(data))
+                    task = Task.from_dict(json.loads(p.read_text(encoding="utf-8")))
                 except Exception:
-                    pass
+                    continue
+                if status and task.status != status:
+                    continue
+                tasks.append(task)
         return sorted(tasks, key=lambda t: t.created_at, reverse=True)
 
     def recover_orphaned_tasks(self) -> int:

@@ -32,9 +32,10 @@ runtime/temporary/*
 !runtime/temporary/.gitkeep
 locks/*
 !locks/.gitkeep
-sessions/*
+sessions/*.json
 !sessions/.gitkeep
-events/*
+events/*.jsonl
+events/*.log
 !events/.gitkeep
 
 # Ephemeral runtime databases & journals
@@ -50,6 +51,7 @@ tasks/active/*.json
 tasks/completed/*.json
 tasks/failed/*.json
 handoffs/archive/*.md
+handoffs/archive/*.json
 
 # Local user configs & OS caches
 .DS_Store

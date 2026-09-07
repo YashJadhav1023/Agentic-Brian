@@ -1,7 +1,12 @@
-"""Unit tests for deterministic model selection, tiers, and verification."""
+"""Deterministic model selection, verified catalogues, and honest verification."""
+import json
 import unittest
+from pathlib import Path
 
+from agents.antigravity.adapter import DEFAULT_CONFIG_PATH
+from agents.base.adapter import UNKNOWN_MODEL
 from models.policies.model_policy import (
+    AGENT_CATALOGS,
     Complexity,
     ModelTier,
     select_model,
@@ -33,11 +38,61 @@ class TestModelPolicy(unittest.TestCase):
         self.assertEqual(dec_a1.tier, ModelTier.FAST)
         self.assertEqual(dec_a1.preferred_model, "gemini-3.8-flash-low")
 
+    def test_account2_is_not_pinned_to_a_single_model(self):
+        """Requirement: the router picks the model; nothing is hard-coded."""
+        chosen = {
+            select_model("antigravity-account-2", complexity=c).preferred_model
+            for c in Complexity
+        }
+        self.assertGreater(len(chosen), 1)
+        self.assertNotEqual(chosen, {"gemini-3.8-flash-low"})
+
+    def test_account2_catalog_matches_configured_models(self):
+        """Catalogue and config must agree; both were verified against the CLI."""
+        config = json.loads(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+        configured = set(
+            config["providers"]["antigravity"]["accounts"]["antigravity-account-2"]["models"]
+        )
+        catalog = {spec.name for spec in AGENT_CATALOGS["antigravity-account-2"]}
+        self.assertEqual(catalog, configured)
+
+    def test_both_accounts_expose_the_same_verified_catalog(self):
+        a1 = {s.name for s in AGENT_CATALOGS["antigravity-account-1"]}
+        a2 = {s.name for s in AGENT_CATALOGS["antigravity-account-2"]}
+        self.assertEqual(a1, a2)
+
+    def test_no_catalog_offers_an_unconfigured_model(self):
+        """Every routable model must exist in the verified config catalogue."""
+        from providers.registry.config import get_accounts
+
+        configured: dict[str, set[str]] = {}
+        for provider_id in ("antigravity", "kiro", "cline"):
+            for account in get_accounts(provider_id):
+                configured[account.agent_id] = set(account.models)
+
+        for agent_id, models in configured.items():
+            catalog = {spec.name for spec in AGENT_CATALOGS.get(agent_id, ())}
+            self.assertTrue(
+                catalog.issubset(models),
+                f"{agent_id} catalogue offers unconfigured models: {catalog - models}",
+            )
+
     def test_verify_actual_model_never_assumes(self):
-        # When payload has explicit model
-        self.assertEqual(verify_actual_model({"actual_model": "gemini-3.8-flash-low"}, "claude-opus-5"), "gemini-3.8-flash-low")
-        # When payload has raw_response
-        self.assertEqual(verify_actual_model({"raw_response": {"model": "gemini-3.8-flash-medium"}}, None), "gemini-3.8-flash-medium")
+        self.assertEqual(
+            verify_actual_model({"actual_model": "gemini-3.8-flash-low"}, "claude-opus-5"),
+            "gemini-3.8-flash-low",
+        )
+        self.assertEqual(
+            verify_actual_model({"raw_response": {"model": "gemini-3.8-flash-medium"}}, None),
+            "gemini-3.8-flash-medium",
+        )
+
+    def test_unreported_model_is_unknown_not_the_requested_model(self):
+        """Requirement: never fabricate model information."""
+        payload = {"status": "SUCCESS", "response": "ok", "usage": {}}
+        self.assertEqual(verify_actual_model(payload, "gemini-3.8-flash-low"), UNKNOWN_MODEL)
+        self.assertEqual(verify_actual_model({}, "auto"), UNKNOWN_MODEL)
+        self.assertEqual(verify_actual_model("plain text", "gemini-3.1-pro-high"), UNKNOWN_MODEL)
 
 
 if __name__ == "__main__":

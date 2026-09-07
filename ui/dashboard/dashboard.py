@@ -64,7 +64,13 @@ class MissionControlHandler(BaseHTTPRequestHandler):
         elif path == "/api/status":
             self._serve_json(self._get_system_status())
         elif path == "/api/agents":
-            self._serve_json(registry.to_dict())
+            self._serve_json(self._get_agents_runtime())
+        elif path == "/api/sessions":
+            self._serve_json(
+                {"sessions": [s.to_dict() for s in orchestrator.sessions.list_recent(50)]}
+            )
+        elif path == "/api/health":
+            self._serve_json(orchestrator.health(deep=False))
         elif path == "/api/tasks":
             tasks = [t.to_dict() for t in task_manager.list_tasks()]
             self._serve_json({"tasks": tasks})
@@ -114,16 +120,10 @@ class MissionControlHandler(BaseHTTPRequestHandler):
             )
             self._serve_json({"status": "created", "task": task.to_dict()})
         elif path == "/api/continue":
-            continuator = UniversalContinuator(task_manager, handoff_manager, workspace_dir=PROJECT_ROOT)
-            ctx = continuator.build_continue_context()
-            task = orchestrator.plan_and_dispatch(
-                instruction=ctx.next_recommended_action,
-                preferred_agent=ctx.target_agent,
-                preferred_model=ctx.target_model,
-            )
-            # Execute in thread to avoid blocking HTTP
-            threading.Thread(target=orchestrator.execute_next, daemon=True).start()
-            self._serve_json({"status": "continued", "task": task.to_dict()})
+            ctx = orchestrator.build_continue_context()
+            # Execute off-thread so the HTTP request does not block on the agent.
+            threading.Thread(target=orchestrator.continue_work, daemon=True).start()
+            self._serve_json({"status": "continued", "context": ctx.to_dict()})
         else:
             self.send_response(404)
             self.end_headers()
@@ -154,6 +154,95 @@ class MissionControlHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+    def _get_agents_runtime(self) -> dict[str, Any]:
+        """Registry view enriched with live task, session, handoff and error state.
+
+        Every agent — including Antigravity Account 2 — is rendered from the same
+        data path, so no agent is a second-class citizen in the UI.
+        """
+        providers = registry.to_dict()
+        all_tasks = task_manager.list_tasks()
+        sessions = orchestrator.sessions.list_recent(200)
+        events = event_bus.get_recent_events(400)
+
+        for provider in providers.values():
+            for agent_id, account in provider["accounts"].items():
+                agent_tasks = [t for t in all_tasks if t.assigned_agent == agent_id]
+                agent_sessions = [s for s in sessions if s.agent_id == agent_id]
+                agent_events = [e for e in events if e.agent_id == agent_id]
+
+                running = [t for t in agent_tasks if t.status == TaskStatus.RUNNING]
+                completed = [t for t in agent_tasks if t.status == TaskStatus.COMPLETED]
+                failed = [t for t in agent_tasks if t.status == TaskStatus.FAILED]
+
+                if not account.get("healthy"):
+                    display_status = "OFFLINE"
+                elif running:
+                    display_status = "WORKING"
+                elif failed and (not completed or failed[0].created_at > completed[0].created_at):
+                    display_status = "FAILED"
+                elif agent_tasks:
+                    display_status = "IDLE"
+                else:
+                    display_status = "ONLINE"
+
+                latest = running[0] if running else (agent_tasks[0] if agent_tasks else None)
+                latest_session = agent_sessions[0] if agent_sessions else None
+
+                account.update(
+                    {
+                        "display_status": display_status,
+                        "current_task": {
+                            "task_id": latest.task_id,
+                            "title": latest.title,
+                            "status": latest.status.value,
+                            "requested_model": latest.assigned_model,
+                            "reported_model": latest.actual_model,
+                            "duration_seconds": latest.duration_seconds,
+                        }
+                        if latest
+                        else None,
+                        "session_id": latest_session.session_id if latest_session else None,
+                        "conversation_id": latest_session.conversation_id if latest_session else None,
+                        "last_activity": (
+                            agent_events[0].timestamp if agent_events else
+                            (latest_session.updated_at if latest_session else None)
+                        ),
+                        "counts": {
+                            "total": len(agent_tasks),
+                            "running": len(running),
+                            "completed": len(completed),
+                            "failed": len(failed),
+                        },
+                        "recent_tasks": [
+                            {
+                                "task_id": t.task_id,
+                                "title": t.title,
+                                "status": t.status.value,
+                                "requested_model": t.assigned_model,
+                                "reported_model": t.actual_model,
+                                "conversation_id": t.conversation_id,
+                                "duration_seconds": t.duration_seconds,
+                                "files": t.files,
+                                "handoffs": t.handoffs,
+                            }
+                            for t in agent_tasks[:10]
+                        ],
+                        "recent_errors": [
+                            err for t in agent_tasks[:10] for err in t.errors
+                        ][:5],
+                        "recent_events": [
+                            {
+                                "event_type": e.event_type.value,
+                                "timestamp": e.timestamp,
+                                "task_id": e.task_id,
+                            }
+                            for e in agent_events[:10]
+                        ],
+                    }
+                )
+        return providers
+
     def _get_system_status(self) -> dict[str, Any]:
         tasks = task_manager.list_tasks()
         return {
@@ -161,8 +250,9 @@ class MissionControlHandler(BaseHTTPRequestHandler):
             "running_tasks": len([t for t in tasks if t.status == TaskStatus.RUNNING]),
             "completed_tasks": len([t for t in tasks if t.status == TaskStatus.COMPLETED]),
             "ready_tasks": len([t for t in tasks if t.status == TaskStatus.READY]),
+            "failed_tasks": len([t for t in tasks if t.status == TaskStatus.FAILED]),
             "memories_count": memory_store.count(),
-            "agents": registry.to_dict(),
+            "agents": self._get_agents_runtime(),
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
 
@@ -434,17 +524,35 @@ class MissionControlHandler(BaseHTTPRequestHandler):
             const card = document.createElement('div');
             card.className = 'bg-slate-900 border border-slate-800 p-4 rounded-lg space-y-2';
             const dot = a.healthy ? 'bg-emerald-500' : 'bg-red-500';
+            const statusColors = {
+              WORKING: 'bg-amber-500/20 text-amber-300',
+              ONLINE: 'bg-emerald-500/20 text-emerald-300',
+              IDLE: 'bg-sky-500/20 text-sky-300',
+              FAILED: 'bg-red-500/20 text-red-300',
+              OFFLINE: 'bg-slate-700 text-slate-400'
+            };
+            const st = a.display_status || (a.healthy ? 'ONLINE' : 'OFFLINE');
+            const cur = a.current_task;
+            const c = a.counts || {total: 0, completed: 0, failed: 0};
             card.innerHTML = `
               <div class="flex items-center justify-between">
                 <div class="flex items-center gap-2">
                   <div class="w-2.5 h-2.5 rounded-full ${dot}"></div>
                   <span class="font-bold text-white text-sm">${a.agent_id}</span>
                 </div>
-                <span class="text-[10px] px-2 py-0.5 rounded bg-slate-800 text-slate-400 font-mono">${a.execution_mode}</span>
+                <span class="text-[10px] px-2 py-0.5 rounded font-mono ${statusColors[st] || statusColors.OFFLINE}">${st}</span>
               </div>
-              <div class="text-xs text-slate-400">Account: <span class="text-slate-200">${a.account_id}</span> | Provider: <span class="text-slate-200">${a.provider}</span></div>
-              <div class="text-[11px] text-slate-500">Status: ${a.health_reason}</div>
-              <div class="text-[11px] text-slate-400">Models: <span class="font-mono text-emerald-400">${a.models.slice(0, 3).join(', ')}...</span></div>
+              <div class="text-xs text-slate-400">Account: <span class="text-slate-200">${a.account_id}</span> | Provider: <span class="text-slate-200">${a.provider}</span> | <span class="font-mono text-[10px]">${a.execution_mode}</span></div>
+              ${a.profile ? `<div class="text-[10px] text-slate-500 font-mono truncate">Profile: ${a.profile}</div>` : ''}
+              <div class="text-[11px] text-slate-500">Health: ${a.health_reason}</div>
+              <div class="text-[11px] text-slate-400">Current task: ${cur ? `<span class="text-slate-200">${cur.title.slice(0, 42)}</span> <span class="font-mono text-[10px] text-slate-500">(${cur.status})</span>` : '<span class="text-slate-600">none</span>'}</div>
+              <div class="text-[11px] text-slate-400">Model: <span class="font-mono text-emerald-400">${cur ? (cur.requested_model || 'auto') : (a.default_model || 'auto')}</span>${cur && cur.reported_model ? ` <span class="text-slate-500">(reported: ${cur.reported_model})</span>` : ''}</div>
+              <div class="text-[10px] text-slate-500 font-mono truncate">Session: ${a.session_id || '-'}</div>
+              <div class="text-[10px] text-slate-500 font-mono truncate">Conversation: ${a.conversation_id || '-'}</div>
+              <div class="text-[10px] text-slate-500">Duration: ${cur && cur.duration_seconds ? cur.duration_seconds.toFixed(2) + 's' : '-'} | Last activity: ${a.last_activity ? a.last_activity.slice(0, 19).replace('T', ' ') : '-'}</div>
+              <div class="text-[10px] text-slate-400">Tasks: ${c.total} total, <span class="text-emerald-400">${c.completed} done</span>, <span class="text-red-400">${c.failed} failed</span></div>
+              ${(a.recent_errors && a.recent_errors.length) ? `<div class="text-[10px] text-red-400/80 truncate" title="${a.recent_errors[0].replace(/"/g, '')}">Last error: ${a.recent_errors[0].slice(0, 60)}</div>` : ''}
+              <div class="text-[11px] text-slate-400">Models (${a.models.length}): <span class="font-mono text-emerald-400">${a.models.slice(0, 3).join(', ')}${a.models.length > 3 ? ' ...' : ''}</span></div>
             `;
             grid.appendChild(card);
           }

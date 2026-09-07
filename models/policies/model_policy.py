@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from agents.base.adapter import UNKNOWN_MODEL
+
 
 class AgentTarget(str, Enum):
     """The 4 active execution agents."""
@@ -85,35 +87,54 @@ KIRO_CATALOG: tuple[ModelSpec, ...] = (
     ModelSpec("auto", AgentTarget.KIRO_CLI, ModelTier.AUTO, 3, 0, Specialization.GENERAL),
 )
 
-# Cline CLI Catalog
+# Cline CLI Catalog.
+# The Cline CLI does not expose a model listing, and its model selection is bound
+# to the configured provider account. Nothing beyond `auto` has been verified, so
+# nothing beyond `auto` is offered — an unverified model id is worse than none.
 CLINE_CATALOG: tuple[ModelSpec, ...] = (
-    ModelSpec("anthropic/claude-opus-5", AgentTarget.CLINE, ModelTier.FRONTIER, 5, 1_000_000, Specialization.REASONING, True),
-    ModelSpec("openai/gpt-5.6-sol", AgentTarget.CLINE, ModelTier.FRONTIER, 5, 272_000, Specialization.CODING, True),
-    ModelSpec("moonshotai/kimi-k3", AgentTarget.CLINE, ModelTier.ADVANCED, 4, 200_000, Specialization.CODING, True),
-    ModelSpec("deepseek/deepseek-v4-flash", AgentTarget.CLINE, ModelTier.FAST, 2, 1_000_000, Specialization.CODING, True),
-    ModelSpec("z-ai/glm-5.3-flash", AgentTarget.CLINE, ModelTier.FAST, 2, 128_000, Specialization.GENERAL, True),
+    ModelSpec("auto", AgentTarget.CLINE, ModelTier.AUTO, 3, 0, Specialization.GENERAL, False),
 )
 
-# Antigravity Account 1 Catalog (Verified via installed CLI)
+# Antigravity Account 1 Catalog.
+# Enumerated live: `agy --app_data_dir=antigravity-cli models`.
+# Order matters: within an equal-strength band the first entry wins, which keeps
+# selection deterministic.
 ANTIGRAVITY_ACCOUNT_1_CATALOG: tuple[ModelSpec, ...] = (
     ModelSpec("claude-opus-4-6-thinking", AgentTarget.ANTIGRAVITY_ACCOUNT_1, ModelTier.FRONTIER, 5, 1_000_000, Specialization.REASONING, True),
     ModelSpec("gemini-3.1-pro-high", AgentTarget.ANTIGRAVITY_ACCOUNT_1, ModelTier.FRONTIER, 5, 1_000_000, Specialization.REASONING, True),
     ModelSpec("claude-sonnet-4-6", AgentTarget.ANTIGRAVITY_ACCOUNT_1, ModelTier.ADVANCED, 4, 1_000_000, Specialization.CODING, False),
     ModelSpec("gemini-3.8-flash-high", AgentTarget.ANTIGRAVITY_ACCOUNT_1, ModelTier.ADVANCED, 4, 1_000_000, Specialization.GENERAL, True),
+    ModelSpec("gemini-3.1-pro-low", AgentTarget.ANTIGRAVITY_ACCOUNT_1, ModelTier.ADVANCED, 4, 1_000_000, Specialization.REASONING, True),
     ModelSpec("gemini-3.8-flash-medium", AgentTarget.ANTIGRAVITY_ACCOUNT_1, ModelTier.BALANCED, 3, 1_000_000, Specialization.GENERAL, True),
     ModelSpec("gemini-3.7-flash-high", AgentTarget.ANTIGRAVITY_ACCOUNT_1, ModelTier.BALANCED, 3, 1_000_000, Specialization.GENERAL, True),
+    ModelSpec("gpt-oss-120b-medium", AgentTarget.ANTIGRAVITY_ACCOUNT_1, ModelTier.CODING, 3, 128_000, Specialization.CODING, False),
+    ModelSpec("gemini-3.6-flash-high", AgentTarget.ANTIGRAVITY_ACCOUNT_1, ModelTier.BALANCED, 3, 1_000_000, Specialization.GENERAL, True),
     ModelSpec("gemini-3.8-flash-low", AgentTarget.ANTIGRAVITY_ACCOUNT_1, ModelTier.FAST, 2, 1_000_000, Specialization.GENERAL, True),
+    ModelSpec("gemini-3.7-flash-medium", AgentTarget.ANTIGRAVITY_ACCOUNT_1, ModelTier.FAST, 2, 1_000_000, Specialization.GENERAL, True),
     ModelSpec("gemini-3.7-flash-low", AgentTarget.ANTIGRAVITY_ACCOUNT_1, ModelTier.FAST, 2, 1_000_000, Specialization.GENERAL, True),
+    ModelSpec("gemini-3.6-flash-medium", AgentTarget.ANTIGRAVITY_ACCOUNT_1, ModelTier.FAST, 2, 1_000_000, Specialization.GENERAL, True),
+    ModelSpec("gemini-3.6-flash-low", AgentTarget.ANTIGRAVITY_ACCOUNT_1, ModelTier.FAST, 2, 1_000_000, Specialization.GENERAL, True),
 )
 
-# Antigravity Account 2 Catalog (Verified via installed CLI with --app_data_dir=antigravity-ide)
+# Antigravity Account 2 Catalog.
+# Enumerated live: `agy --app_data_dir=antigravity-ide models`. Account 2 exposes
+# the same 14 model ids as Account 1; the accounts differ only by profile and
+# quota, never by capability of the model catalogue.
 ANTIGRAVITY_ACCOUNT_2_CATALOG: tuple[ModelSpec, ...] = (
     ModelSpec("gemini-3.1-pro-high", AgentTarget.ANTIGRAVITY_ACCOUNT_2, ModelTier.FRONTIER, 5, 1_000_000, Specialization.REASONING, True),
+    ModelSpec("claude-opus-4-6-thinking", AgentTarget.ANTIGRAVITY_ACCOUNT_2, ModelTier.FRONTIER, 5, 1_000_000, Specialization.REASONING, True),
+    ModelSpec("claude-sonnet-4-6", AgentTarget.ANTIGRAVITY_ACCOUNT_2, ModelTier.ADVANCED, 4, 1_000_000, Specialization.CODING, False),
     ModelSpec("gemini-3.8-flash-high", AgentTarget.ANTIGRAVITY_ACCOUNT_2, ModelTier.ADVANCED, 4, 1_000_000, Specialization.GENERAL, True),
+    ModelSpec("gemini-3.1-pro-low", AgentTarget.ANTIGRAVITY_ACCOUNT_2, ModelTier.ADVANCED, 4, 1_000_000, Specialization.REASONING, True),
     ModelSpec("gemini-3.8-flash-medium", AgentTarget.ANTIGRAVITY_ACCOUNT_2, ModelTier.BALANCED, 3, 1_000_000, Specialization.GENERAL, True),
     ModelSpec("gemini-3.7-flash-high", AgentTarget.ANTIGRAVITY_ACCOUNT_2, ModelTier.BALANCED, 3, 1_000_000, Specialization.GENERAL, True),
+    ModelSpec("gpt-oss-120b-medium", AgentTarget.ANTIGRAVITY_ACCOUNT_2, ModelTier.CODING, 3, 128_000, Specialization.CODING, False),
+    ModelSpec("gemini-3.6-flash-high", AgentTarget.ANTIGRAVITY_ACCOUNT_2, ModelTier.BALANCED, 3, 1_000_000, Specialization.GENERAL, True),
     ModelSpec("gemini-3.8-flash-low", AgentTarget.ANTIGRAVITY_ACCOUNT_2, ModelTier.FAST, 2, 1_000_000, Specialization.GENERAL, True),
+    ModelSpec("gemini-3.7-flash-medium", AgentTarget.ANTIGRAVITY_ACCOUNT_2, ModelTier.FAST, 2, 1_000_000, Specialization.GENERAL, True),
     ModelSpec("gemini-3.7-flash-low", AgentTarget.ANTIGRAVITY_ACCOUNT_2, ModelTier.FAST, 2, 1_000_000, Specialization.GENERAL, True),
+    ModelSpec("gemini-3.6-flash-medium", AgentTarget.ANTIGRAVITY_ACCOUNT_2, ModelTier.FAST, 2, 1_000_000, Specialization.GENERAL, True),
+    ModelSpec("gemini-3.6-flash-low", AgentTarget.ANTIGRAVITY_ACCOUNT_2, ModelTier.FAST, 2, 1_000_000, Specialization.GENERAL, True),
 )
 
 AGENT_CATALOGS: dict[str, tuple[ModelSpec, ...]] = {
@@ -205,22 +226,23 @@ def select_model(
 
 
 def verify_actual_model(response_payload: dict[str, Any] | str, requested_model: str | None) -> str:
-    """Extract and verify actual model used from execution output. Never assumes requested model."""
+    """Return the model a provider *reported*, or `unknown`.
+
+    The requested model is never echoed back as the actual model. Antigravity's
+    JSON print-mode payload contains no model field (verified live), so for
+    Antigravity executions this returns `unknown` and the requested model is
+    tracked separately on the task record.
+    """
     if isinstance(response_payload, dict):
-        # Check standard metadata fields
-        for field in ("actual_model", "model", "model_used", "engine"):
-            val = response_payload.get(field)
-            if val and isinstance(val, str) and val.strip():
+        for key in ("actual_model", "model", "model_used", "model_version", "engine"):
+            val = response_payload.get(key)
+            if isinstance(val, str) and val.strip():
                 return val.strip()
-        # Check usage or response metadata
-        raw_resp = response_payload.get("raw_response", {})
+        raw_resp = response_payload.get("raw_response")
         if isinstance(raw_resp, dict):
-            for field in ("model", "model_version", "model_name"):
-                val = raw_resp.get(field)
-                if val and isinstance(val, str) and val.strip():
+            for key in ("model", "model_version", "model_name"):
+                val = raw_resp.get(key)
+                if isinstance(val, str) and val.strip():
                     return val.strip()
 
-    # If response is a string or failed to extract model, return verified indicator
-    if requested_model and requested_model != "auto":
-        return f"{requested_model} (verified via CLI invocation)"
-    return "default (unreported by provider)"
+    return UNKNOWN_MODEL
