@@ -359,8 +359,11 @@ class MissionControlHandler(BaseHTTPRequestHandler):
             self._serve_json({"status": "created", "task": task.to_dict()})
         elif path == "/api/continue":
             ctx = orchestrator.build_continue_context()
-            threading.Thread(target=orchestrator.continue_work, daemon=True).start()
-            self._serve_json({"status": "continued", "context": ctx.to_dict()})
+            if getattr(ctx, "is_terminal", False):
+                self._serve_json({"status": "terminal", "reason": ctx.terminal_reason, "context": ctx.to_dict()})
+            else:
+                threading.Thread(target=orchestrator.continue_work, daemon=True).start()
+                self._serve_json({"status": "continued", "context": ctx.to_dict()})
         elif path == "/api/worktrees/approve":
             task_id = payload.get("task_id")
             if not task_id:

@@ -13,7 +13,7 @@ python3 scripts/brain.py health --deep           # Deep health probe per account
 python3 scripts/brain.py status                  # Recent tasks and execution states
 python3 scripts/brain.py sessions                # Task -> session -> conversation mapping
 python3 scripts/brain.py worktree status         # List active isolated git worktree sandboxes
-python3 -m unittest discover -s tests            # Run full test suite (116 passing tests)
+python3 -m unittest discover -s tests            # Run full test suite (131 passing tests)
 ```
 
 `health` exits with code `0` when all agents are healthy, or `1` if any agent is degraded or unhealthy.
@@ -46,7 +46,28 @@ python3 scripts/brain.py continue
 
 ---
 
-## 3. Git Worktree Sandbox Management
+## 3. Continuation & Verification Lifecycle Contract
+
+Phase 4A enforces a strict termination contract to prevent recursive loops and runaway execution:
+
+### Invariants & Bounds
+- **`max_continuation_depth`** (default `5`): Maximum consecutive continuation steps allowed for a task lineage.
+- **`max_verification_depth`** (default `1`): A verification task may only verify a primary execution task; verification-of-verification is strictly forbidden.
+- **`continuation_budget`** (default `5`): Decremented on each continuation step. Execution terminates with `BUDGET_EXHAUSTED` when budget reaches `0`.
+- **Idempotency**: A task can only have one pending or active verification task (`verification_for`). Duplicate verifications are rejected immediately.
+
+### Terminal Statuses
+When a task enters any of the following terminal statuses, continuation halts cleanly with zero new tasks dispatched:
+- `VERIFICATION_COMPLETE` — Verification task finished successfully; lineage is complete.
+- `DEPTH_LIMIT_REACHED` — Continuation depth exceeded `max_continuation_depth`.
+- `BUDGET_EXHAUSTED` — Continuation budget exhausted.
+- `REJECTED` — Duplicate verification or verification-of-verification attempted.
+- `CANCELLED` — Explicitly aborted by user.
+- `COMPLETED` / `FAILED` — When explicitly marked with `is_terminal=True` or has no remaining work.
+
+---
+
+## 4. Git Worktree Sandbox Management
 
 When an agent executes a mutating task, changes are quarantined inside `runtime/sandboxes/agentic-task-<task_id>`. Use the `worktree` subcommands to inspect and manage them:
 

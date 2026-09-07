@@ -61,3 +61,31 @@ branch `main`).
 | 3.9 | CLI Worktree Surface | COMPLETED | Added `worktree status`, `worktree diff`, `worktree approve --confirm`, `worktree reject --confirm`, `worktree recover`, `worktree cleanup --confirm` to `scripts/brain.py` |
 | 3.10 | Documentation & Security Audits | COMPLETED | Created `docs/SECURITY.md`, `docs/WORKTREE_SANDBOX.md`; updated `docs/OPERATIONS.md`, `docs/TROUBLESHOOTING.md`, `docs/MIGRATION_PLAN.md`; added `MISSION_CONTROL_AUTH_TOKEN` placeholder to `.env.example` |
 | 3.11 | Overall Test Suite | COMPLETED | **116 passing tests** across unit and integration suites with zero regressions |
+
+---
+
+## Phase 4 — Smart Routing, Model Selection, Context & Token Optimization
+
+### Phase 4 Comprehensive Architecture Audit
+- **Status**: COMPLETED
+- **Evidence**: 928-line architecture audit report generated at `/home/setoo/Downloads/PHASE_4_AUDIT_REPORT.md` analyzing SmartRouter, ModelPolicy, UniversalContinuator, MemoryStore, MemoryRetriever, SwarmWorkerPool, WorktreeManager, and Mission Control. Working tree kept 100% clean (git baseline `cccf395`).
+
+### Phase 4A — Recursive Verification Loop + Continuation Termination Contract
+- **Status**: COMPLETED
+- **Objectives & Scope**:
+  1. Fix recursive verification loops (`TASK -> VERIFY -> VERIFY -> VERIFY ...`).
+  2. Enforce hard continuation termination contract with depth limits (`max_continuation_depth=5`), verification limits (`max_verification_depth=1`), and budget limits (`continuation_budget=5`).
+  3. Prevent verification-of-verification recursion and duplicate verification tasks (idempotency).
+  4. Define and enforce terminal states: `COMPLETED`, `VERIFICATION_COMPLETE`, `DEPTH_LIMIT_REACHED`, `BUDGET_EXHAUSTED`, `FAILED`, `CANCELLED`, `REJECTED`.
+  5. Add Phase 4A audit event types to `EventBus` (`CONTINUATION_STARTED`, `CONTINUATION_TERMINATED`, `VERIFICATION_STARTED`, `VERIFICATION_COMPLETED`, `VERIFICATION_REJECTED`, `RECURSION_PREVENTED`, `BUDGET_EXHAUSTED`, `DEPTH_LIMIT_REACHED`).
+  6. Harden `UniversalContinuator`, `BrainOrchestrator`, `TaskManager`, `SwarmWorkerPool`, `scripts/brain.py`, and Mission Control `/api/continue`.
+- **Key Implementation Details**:
+  - `tasks/manager.py`: Extended `TaskStatus` with `VERIFICATION_COMPLETE`, `DEPTH_LIMIT_REACHED`, `BUDGET_EXHAUSTED`, `REJECTED`. Added continuation tracking fields (`task_type`, `continuation_depth`, `max_continuation_depth`, `verification_depth`, `max_verification_depth`, `continuation_budget`, `verification_for`, `is_terminal`, `terminal_reason`).
+  - `brain/orchestrator/swarm.py`: In `_on_success`, verification tasks transition to `TaskStatus.VERIFICATION_COMPLETE`, set `is_terminal=True`, empty `remaining_work`, set `recommended_agent="none"`, and emit `VERIFICATION_COMPLETED` + `CONTINUATION_TERMINATED`. In `_on_failure`, budget-bounded remediation halts when budget reaches 0 or depth reaches max.
+  - `brain/orchestrator/orchestrator.py`: `plan_and_dispatch` rejects duplicate verifications (`DUPLICATE_VERIFICATION_PREVENTED`), rejects verification of verification (`VERIFICATION_OF_VERIFICATION_PREVENTED`), enforces budget and depth limits. `continue_work` halts when `ctx.is_terminal` and returns `(ctx, None)` with zero tasks dispatched.
+  - `brain/context/continuator.py`: Propagates termination metadata in `ContinueContext`. Stops when latest task is in terminal state or limits are exceeded.
+  - `tests/unit/test_continuation_contract.py`: 15 comprehensive unit tests covering all 15 termination scenarios.
+- **Verification & Test Results**:
+  - `tests/unit/test_continuation_contract.py`: **15/15 passing**.
+  - Full test suite: **131/131 passing** (116 existing + 15 new) with zero regressions.
+

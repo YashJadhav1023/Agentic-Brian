@@ -164,7 +164,10 @@ def cmd_continue(args: argparse.Namespace) -> None:
     print(f"Git state:      {ctx.git_diff_stat}")
     if ctx.resume_conversation_id:
         print(f"Resuming conversation: {ctx.resume_conversation_id}")
-    _print_result(result)
+    if getattr(ctx, "is_terminal", False):
+        print(f"\n[TERMINAL] Continuation terminated: {ctx.terminal_reason}")
+    elif result is not None:
+        _print_result(result)
 
 
 def cmd_status(args: argparse.Namespace) -> None:

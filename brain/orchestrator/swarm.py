@@ -247,6 +247,165 @@ class SwarmWorkerPool:
     def execute_task(self, task: Task) -> TaskExecutionResult:
         """Execute a single task synchronously on its assigned agent."""
         agent_id = task.assigned_agent or "antigravity-account-1"
+
+        # Pre-flight Phase 4A guards: check terminal states and depth/budget limits
+        if task.is_terminal_state:
+            return TaskExecutionResult(
+                task_id=task.task_id,
+                agent_id=agent_id,
+                account_id="unknown",
+                provider="unknown",
+                success=False,
+                exit_code=1,
+                output="",
+                error=f"Task {task.task_id} is already in a terminal state ({task.status.value})",
+                actual_model=UNKNOWN_MODEL,
+            )
+
+        if task.continuation_budget <= 0:
+            self._task_manager.update_status(
+                task.task_id,
+                TaskStatus.BUDGET_EXHAUSTED,
+                error="Continuation budget exhausted",
+                is_terminal=True,
+                terminal_reason="BUDGET_EXHAUSTED",
+            )
+            self._event_bus.publish(
+                EventType.BUDGET_EXHAUSTED,
+                agent_id=agent_id,
+                task_id=task.task_id,
+                metadata={"budget": task.continuation_budget},
+            )
+            self._event_bus.publish(
+                EventType.CONTINUATION_TERMINATED,
+                agent_id=agent_id,
+                task_id=task.task_id,
+                metadata={"reason": "BUDGET_EXHAUSTED"},
+            )
+            return TaskExecutionResult(
+                task_id=task.task_id,
+                agent_id=agent_id,
+                account_id="unknown",
+                provider="unknown",
+                success=False,
+                exit_code=1,
+                output="",
+                error="Continuation budget exhausted",
+                actual_model=UNKNOWN_MODEL,
+            )
+
+        if task.continuation_depth > task.max_continuation_depth:
+            self._task_manager.update_status(
+                task.task_id,
+                TaskStatus.DEPTH_LIMIT_REACHED,
+                error=f"Continuation depth limit ({task.max_continuation_depth}) reached",
+                is_terminal=True,
+                terminal_reason="DEPTH_LIMIT_REACHED",
+            )
+            self._event_bus.publish(
+                EventType.DEPTH_LIMIT_REACHED,
+                agent_id=agent_id,
+                task_id=task.task_id,
+                metadata={"depth": task.continuation_depth, "max_depth": task.max_continuation_depth},
+            )
+            self._event_bus.publish(
+                EventType.CONTINUATION_TERMINATED,
+                agent_id=agent_id,
+                task_id=task.task_id,
+                metadata={"reason": "DEPTH_LIMIT_REACHED"},
+            )
+            return TaskExecutionResult(
+                task_id=task.task_id,
+                agent_id=agent_id,
+                account_id="unknown",
+                provider="unknown",
+                success=False,
+                exit_code=1,
+                output="",
+                error=f"Continuation depth limit ({task.max_continuation_depth}) reached",
+                actual_model=UNKNOWN_MODEL,
+            )
+
+        if task.is_verification:
+            if task.verification_depth > task.max_verification_depth:
+                self._task_manager.update_status(
+                    task.task_id,
+                    TaskStatus.DEPTH_LIMIT_REACHED,
+                    error=f"Verification depth limit ({task.max_verification_depth}) exceeded",
+                    is_terminal=True,
+                    terminal_reason="DEPTH_LIMIT_REACHED",
+                )
+                self._event_bus.publish(
+                    EventType.RECURSION_PREVENTED,
+                    agent_id=agent_id,
+                    task_id=task.task_id,
+                    metadata={"verification_depth": task.verification_depth},
+                )
+                self._event_bus.publish(
+                    EventType.DEPTH_LIMIT_REACHED,
+                    agent_id=agent_id,
+                    task_id=task.task_id,
+                    metadata={"depth": task.verification_depth, "max_depth": task.max_verification_depth},
+                )
+                self._event_bus.publish(
+                    EventType.CONTINUATION_TERMINATED,
+                    agent_id=agent_id,
+                    task_id=task.task_id,
+                    metadata={"reason": "DEPTH_LIMIT_REACHED"},
+                )
+                return TaskExecutionResult(
+                    task_id=task.task_id,
+                    agent_id=agent_id,
+                    account_id="unknown",
+                    provider="unknown",
+                    success=False,
+                    exit_code=1,
+                    output="",
+                    error=f"Verification depth limit ({task.max_verification_depth}) exceeded",
+                    actual_model=UNKNOWN_MODEL,
+                )
+
+            if task.parent_task:
+                parent = self._task_manager.get_task(task.parent_task)
+                if parent and (parent.is_verification or parent.task_type == "verification"):
+                    self._task_manager.update_status(
+                        task.task_id,
+                        TaskStatus.REJECTED,
+                        error="Recursive verification is prohibited",
+                        is_terminal=True,
+                        terminal_reason="RECURSION_PREVENTED",
+                    )
+                    self._event_bus.publish(
+                        EventType.RECURSION_PREVENTED,
+                        agent_id=agent_id,
+                        task_id=task.task_id,
+                        metadata={"parent_task": task.parent_task},
+                    )
+                    self._event_bus.publish(
+                        EventType.VERIFICATION_REJECTED,
+                        agent_id=agent_id,
+                        task_id=task.task_id,
+                        metadata={"reason": "Recursive verification is prohibited"},
+                    )
+                    return TaskExecutionResult(
+                        task_id=task.task_id,
+                        agent_id=agent_id,
+                        account_id="unknown",
+                        provider="unknown",
+                        success=False,
+                        exit_code=1,
+                        output="",
+                        error="Recursive verification is prohibited",
+                        actual_model=UNKNOWN_MODEL,
+                    )
+
+            self._event_bus.publish(
+                EventType.VERIFICATION_STARTED,
+                agent_id=agent_id,
+                task_id=task.task_id,
+                metadata={"verification_for": task.verification_for, "depth": task.verification_depth},
+            )
+
         adapter = self._registry.get_adapter(agent_id)
 
         if not adapter:
@@ -576,21 +735,80 @@ class SwarmWorkerPool:
             if (worktree_record and result.files_touched)
             else self._git_state()
         )
-        recommended_agent = (
-            VERIFICATION_AGENT if agent_id != VERIFICATION_AGENT else "antigravity-account-1"
-        )
 
-        if worktree_record and result.files_touched:
-            next_action = f"Review diff for task {task.task_id} on branch {worktree_record.branch} and approve/apply changes."
+        if task.is_verification:
+            # Phase 4A: Terminal verification contract
+            # Verification tasks MUST terminate the verification loop!
+            final_status = TaskStatus.VERIFICATION_COMPLETE
+            is_terminal = True
+            terminal_reason = "VERIFICATION_COMPLETE"
+            remaining_work: list[str] = []
+            next_action = f"Verification of task {task.verification_for or task.task_id} completed successfully; workflow is complete."
+            recommended_agent = "none"
+            recommended_model = "none"
+
+            self._event_bus.publish(
+                EventType.VERIFICATION_COMPLETED,
+                agent_id=agent_id,
+                task_id=task.task_id,
+                session_id=session_id,
+                metadata={
+                    "verification_for": task.verification_for,
+                    "depth": task.verification_depth,
+                },
+            )
+            self._event_bus.publish(
+                EventType.CONTINUATION_TERMINATED,
+                agent_id=agent_id,
+                task_id=task.task_id,
+                session_id=session_id,
+                metadata={"reason": "VERIFICATION_COMPLETE"},
+            )
         else:
-            next_action = (
-                f"Verify the output of task {task.task_id} ('{task.title}') and integrate it."
+            # Normal task completed. Check if verification is eligible
+            can_verify = (
+                task.verification_depth < task.max_verification_depth
+                and task.continuation_budget > 0
+                and task.continuation_depth < task.max_continuation_depth
             )
-        if result.conversation_id:
-            next_action += (
-                f" Resume the originating conversation with "
-                f"--conversation={result.conversation_id} if deeper context is required."
-            )
+            existing_verif = [
+                t for t in self._task_manager.list_tasks()
+                if t.verification_for == task.task_id
+                or (t.task_type == "verification" and task.task_id in t.description)
+            ]
+            if can_verify and not existing_verif:
+                recommended_agent = (
+                    VERIFICATION_AGENT if agent_id != VERIFICATION_AGENT else "antigravity-account-1"
+                )
+                recommended_model = "auto"
+                if worktree_record and result.files_touched:
+                    next_action = f"Review diff for task {task.task_id} on branch {worktree_record.branch} and approve/apply changes."
+                else:
+                    next_action = f"Verify output of task {task.task_id} ('{task.title}') and integrate it."
+                if result.conversation_id:
+                    next_action += (
+                        f" Resume the originating conversation with "
+                        f"--conversation={result.conversation_id} if deeper context is required."
+                    )
+                remaining_work = ["Verify the produced result and integrate it"]
+                is_terminal = False
+                terminal_reason = None
+                final_status = TaskStatus.COMPLETED
+            else:
+                next_action = f"Task {task.task_id} completed successfully; workflow complete."
+                recommended_agent = "none"
+                recommended_model = "none"
+                remaining_work = []
+                is_terminal = True
+                terminal_reason = "COMPLETED"
+                final_status = TaskStatus.COMPLETED
+                self._event_bus.publish(
+                    EventType.CONTINUATION_TERMINATED,
+                    agent_id=agent_id,
+                    task_id=task.task_id,
+                    session_id=session_id,
+                    metadata={"reason": "COMPLETED"},
+                )
 
         record = HandoffRecord(
             task=task.title,
@@ -612,21 +830,31 @@ class SwarmWorkerPool:
             ],
             relevant_memory=stored_refs,
             git_state=git_state,
-            remaining_work=["Verify the produced result and integrate it"],
+            remaining_work=remaining_work,
             next_action=next_action,
             recommended_agent=recommended_agent,
-            recommended_model="auto",
+            recommended_model=recommended_model,
             task_id=task.task_id,
             agent_id=agent_id,
             account_id=adapter.account_id,
             session_id=session_id,
             conversation_id=result.conversation_id,
+            parent_task_id=task.task_id,
+            task_type=task.task_type,
+            continuation_depth=task.continuation_depth,
+            max_continuation_depth=task.max_continuation_depth,
+            verification_depth=task.verification_depth,
+            max_verification_depth=task.max_verification_depth,
+            continuation_budget=task.continuation_budget,
+            is_terminal=is_terminal,
+            terminal_reason=terminal_reason,
+            verification_for=task.verification_for,
         )
         handoff_path = self._handoff_manager.write_handoff(record)
 
         self._task_manager.update_status(
             task.task_id,
-            TaskStatus.COMPLETED,
+            final_status,
             result=result.normalized(),
             actual_model=result.actual_model,
             requested_model=task.assigned_model,
@@ -635,6 +863,8 @@ class SwarmWorkerPool:
             duration_seconds=result.duration_seconds,
             handoff=str(handoff_path),
             memory_refs=stored_refs,
+            is_terminal=is_terminal,
+            terminal_reason=terminal_reason,
         )
 
         self._event_bus.publish(
@@ -688,9 +918,132 @@ class SwarmWorkerPool:
             worktree_record.error = result.error or f"exit {result.exit_code}"
             self._worktree_manager._save_registry()
 
+        allow_remediation = True
+        if task.execution_options and "allow_remediation" in task.execution_options:
+            allow_remediation = bool(task.execution_options["allow_remediation"])
+
+        can_remediate = (
+            allow_remediation
+            and task.continuation_budget > 1
+            and task.continuation_depth < task.max_continuation_depth
+        )
+
+        if task.is_verification:
+            self._event_bus.publish(
+                EventType.VERIFICATION_REJECTED,
+                agent_id=agent_id,
+                task_id=task.task_id,
+                session_id=session_id,
+                metadata={"error": (result.error or "")[:500]},
+            )
+
+        if can_remediate:
+            # Bounded remediation permitted
+            next_action = f"Remediate failure in task {task.task_id}: {(result.error or '')[:200]}"
+            recommended_agent = task.assigned_agent or "antigravity-account-1"
+            is_terminal = False
+            terminal_reason = None
+            final_status = TaskStatus.FAILED
+
+            record = HandoffRecord(
+                task=task.title,
+                objective=task.description,
+                completed=[],
+                files_modified=task.files,
+                tests=["python3 -m unittest discover -s tests"],
+                errors=[result.error or f"exit {result.exit_code}"],
+                decisions=[],
+                git_state=self._git_state(),
+                remaining_work=[f"Remediate failure: {(result.error or '')[:200]}"],
+                next_action=next_action,
+                recommended_agent=recommended_agent,
+                recommended_model="auto",
+                task_id=task.task_id,
+                agent_id=agent_id,
+                account_id=adapter.account_id,
+                session_id=session_id,
+                conversation_id=result.conversation_id,
+                parent_task_id=task.task_id,
+                task_type="remediation",
+                continuation_depth=task.continuation_depth + 1,
+                max_continuation_depth=task.max_continuation_depth,
+                verification_depth=task.verification_depth,
+                max_verification_depth=task.max_verification_depth,
+                continuation_budget=task.continuation_budget - 1,
+                is_terminal=False,
+                terminal_reason=None,
+                verification_for=task.verification_for,
+            )
+            handoff_path = self._handoff_manager.write_handoff(record)
+        else:
+            # Terminal failure: budget exhausted or depth limit reached
+            is_terminal = True
+            if task.continuation_budget <= 1:
+                final_status = TaskStatus.BUDGET_EXHAUSTED
+                terminal_reason = "BUDGET_EXHAUSTED"
+                self._event_bus.publish(
+                    EventType.BUDGET_EXHAUSTED,
+                    agent_id=agent_id,
+                    task_id=task.task_id,
+                    session_id=session_id,
+                    metadata={"budget": task.continuation_budget},
+                )
+            elif task.continuation_depth >= task.max_continuation_depth:
+                final_status = TaskStatus.DEPTH_LIMIT_REACHED
+                terminal_reason = "DEPTH_LIMIT_REACHED"
+                self._event_bus.publish(
+                    EventType.DEPTH_LIMIT_REACHED,
+                    agent_id=agent_id,
+                    task_id=task.task_id,
+                    session_id=session_id,
+                    metadata={"depth": task.continuation_depth},
+                )
+            else:
+                final_status = TaskStatus.FAILED
+                terminal_reason = "FAILED"
+
+            self._event_bus.publish(
+                EventType.CONTINUATION_TERMINATED,
+                agent_id=agent_id,
+                task_id=task.task_id,
+                session_id=session_id,
+                metadata={"reason": terminal_reason},
+            )
+
+            record = HandoffRecord(
+                task=task.title,
+                objective=task.description,
+                completed=[],
+                files_modified=task.files,
+                tests=["python3 -m unittest discover -s tests"],
+                errors=[result.error or f"exit {result.exit_code}"],
+                decisions=[],
+                git_state=self._git_state(),
+                remaining_work=[],
+                next_action=f"Continuation terminated: {terminal_reason}",
+                recommended_agent="none",
+                recommended_model="none",
+                task_id=task.task_id,
+                agent_id=agent_id,
+                account_id=adapter.account_id,
+                session_id=session_id,
+                conversation_id=result.conversation_id,
+                parent_task_id=task.task_id,
+                task_type=task.task_type,
+                continuation_depth=task.continuation_depth,
+                max_continuation_depth=task.max_continuation_depth,
+                verification_depth=task.verification_depth,
+                max_verification_depth=task.max_verification_depth,
+                continuation_budget=task.continuation_budget,
+                is_terminal=True,
+                terminal_reason=terminal_reason,
+                verification_for=task.verification_for,
+            )
+            handoff_path = self._handoff_manager.write_handoff(record)
+
         self._task_manager.update_status(
             task.task_id,
-            TaskStatus.FAILED,
+            final_status,
             result=result.normalized(),
             error=result.error or f"exit {result.exit_code}",
             actual_model=result.actual_model,
@@ -698,6 +1051,9 @@ class SwarmWorkerPool:
             session_id=session_id,
             conversation_id=result.conversation_id,
             duration_seconds=result.duration_seconds,
+            handoff=str(handoff_path),
+            is_terminal=is_terminal,
+            terminal_reason=terminal_reason,
         )
 
         self._event_bus.publish(
@@ -715,7 +1071,6 @@ class SwarmWorkerPool:
         self._emit(
             "failed",
             EventType.TASK_FAILED,
-
             adapter,
             agent_id,
             task.task_id,

@@ -38,6 +38,17 @@ class HandoffRecord:
     account_id: str | None = None
     session_id: str | None = None
     conversation_id: str | None = None
+    # --- Phase 4A Continuation & Verification Contract Metadata ------------
+    parent_task_id: str | None = None
+    task_type: str = "general"               # "general", "verification", "remediation"
+    continuation_depth: int = 0
+    max_continuation_depth: int = 5
+    verification_depth: int = 0
+    max_verification_depth: int = 1
+    continuation_budget: int = 5
+    is_terminal: bool = False
+    terminal_reason: str | None = None
+    verification_for: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -59,6 +70,11 @@ class HandoffRecord:
             f"**Git State:** {self.git_state}",
             f"**Recommended Agent:** `{self.recommended_agent}`",
             f"**Recommended Model:** `{self.recommended_model}`",
+            f"**Task Type:** `{self.task_type}`",
+            f"**Continuation Depth:** `{self.continuation_depth} / {self.max_continuation_depth}`",
+            f"**Verification Depth:** `{self.verification_depth} / {self.max_verification_depth}`",
+            f"**Remaining Budget:** `{self.continuation_budget}`",
+            f"**Terminal:** `{self.is_terminal}` ({self.terminal_reason or 'in-flight'})",
             "",
             "## Completed Work",
         ]

@@ -99,3 +99,30 @@ Locks carry a TTL and auto-reclaim upon expiration.
 ```bash
 python3 -c "from tasks.manager import TaskManager; print(TaskManager().recover_orphaned_tasks())"
 ```
+
+---
+
+## 4. Continuation & Verification Loop Issues
+
+### Continuation stops with "is_terminal: true" or "status: terminal"
+**Symptom** — `python3 scripts/brain.py continue` or `POST /api/continue` returns:
+```json
+{"status": "terminal", "reason": "DEPTH_LIMIT_REACHED"}
+```
+or `BUDGET_EXHAUSTED` / `VERIFICATION_COMPLETE` / `NO_REMAINING_WORK`.
+**Cause** — Phase 4A continuation bounds protect against infinite execution loops:
+- `DEPTH_LIMIT_REACHED`: The task has continued through 5 consecutive iterations (`max_continuation_depth=5`).
+- `BUDGET_EXHAUSTED`: The allocated budget of 5 continuation steps has been consumed (`continuation_budget=0`).
+- `VERIFICATION_COMPLETE`: A verification task ran and confirmed completion; the lineage is considered finished.
+- `NO_REMAINING_WORK`: Neither task nor handoff specifies pending work.
+**Fix** — If additional work is genuinely needed, dispatch a new explicit task:
+```bash
+python3 scripts/brain.py plan "Next specific objective"
+```
+
+### Verification task rejected with REJECTED
+**Symptom** — A task is marked with status `REJECTED` and `terminal_reason`:
+- `VERIFICATION_OF_VERIFICATION_PREVENTED`: An attempt was made to dispatch a verification task targeting another verification task. Only primary tasks may be verified (`max_verification_depth=1`).
+- `DUPLICATE_VERIFICATION_PREVENTED`: A verification task for the specified target task is already queued, active, or completed.
+**Working as intended** — This prevents `TASK -> VERIFY -> VERIFY -> VERIFY` recursion loops.
+
