@@ -22,11 +22,14 @@ import concurrent.futures
 import os
 import re
 import subprocess
+import threading
 import uuid
 from pathlib import Path
 from typing import Any
 
 from agents.base.adapter import UNKNOWN_MODEL, AgentAdapter, TaskExecutionResult
+from brain.context.context_optimizer import ContextOptimizer, TokenTelemetryTracker
+from brain.orchestrator.failover import FailoverManager
 from brain.worktree.worktree_manager import WorktreeManager, WorktreeRecord, WorktreeStatus
 from events.bus import EventBus, EventType
 from handoffs.handoff_manager import HandoffManager, HandoffRecord
@@ -40,6 +43,7 @@ from sessions.session_manager import SessionManager
 from tasks.manager import Task, TaskManager, TaskStatus
 
 MAX_CONCURRENT_AGENTS = int(os.environ.get("MAX_CONCURRENT_AGENTS", "2"))
+MAX_HEAVY_AGENTS = int(os.environ.get("MAX_HEAVY_AGENTS", "1"))
 
 #: Per-account telemetry event names. Account 2 has dedicated events as required
 #: by the observability contract; the mapping keeps the swarm free of
@@ -75,6 +79,9 @@ class SwarmWorkerPool:
         workspace_dir: Path | None = None,
         max_workers: int = MAX_CONCURRENT_AGENTS,
         worktree_manager: WorktreeManager | None = None,
+        context_optimizer: ContextOptimizer | None = None,
+        token_tracker: TokenTelemetryTracker | None = None,
+        failover_manager: FailoverManager | None = None,
     ) -> None:
         self._task_manager = task_manager
         self._registry = registry or create_default_registry()
@@ -87,6 +94,24 @@ class SwarmWorkerPool:
         self._workspace = workspace_dir or Path.cwd()
         self._max_workers = max(1, max_workers)
         self._worktree_manager = worktree_manager or WorktreeManager(canonical_repo=self._workspace)
+        self._context_optimizer = context_optimizer or ContextOptimizer(event_bus=self._event_bus)
+        self._token_tracker = token_tracker or TokenTelemetryTracker(event_bus=self._event_bus)
+        self._failover_manager = failover_manager or FailoverManager(registry=self._registry, event_bus=self._event_bus)
+        self._max_heavy_agents = max(1, MAX_HEAVY_AGENTS)
+        self._active_heavy_tasks = 0
+        self._heavy_lock = threading.Lock()
+
+    @property
+    def token_tracker(self) -> TokenTelemetryTracker:
+        return self._token_tracker
+
+    @property
+    def context_optimizer(self) -> ContextOptimizer:
+        return self._context_optimizer
+
+    @property
+    def failover_manager(self) -> FailoverManager:
+        return self._failover_manager
 
     @property
     def worktrees(self) -> WorktreeManager:
@@ -151,26 +176,30 @@ class SwarmWorkerPool:
     # ------------------------------------------------------------------
     # Prompt assembly
     # ------------------------------------------------------------------
-    def _build_prompt(self, task: Task) -> tuple[str, list[str]]:
-        """Compose the agent prompt with only *relevant* shared memory.
-
-        The whole memory database is never injected; the retriever caps both the
-        number of entries and the byte budget.
-        """
-        parts = [f"Task: {task.title}", "", "Description:", task.description]
-
+    def _build_prompt(self, task: Task) -> tuple[str, list[str], dict[str, Any]]:
+        """Compose the agent prompt with scoped target files and strict token budgets."""
         memories = self._retriever.retrieve_context(
             query=f"{task.title} {task.description}",
             task_id=task.task_id,
             max_items=5,
-            max_bytes=2048,
+            max_bytes=1500,
         )
         memory_refs = [m.memory_id for m in memories]
         context_block = self._retriever.format_context_for_prompt(memories)
-        if context_block:
-            parts.extend(["", context_block])
+        compressed_handoff = self._handoff_manager.get_compressed_handoff(max_chars=2000)
 
-        return "\n".join(parts), memory_refs
+        optimized_prompt, report = self._context_optimizer.optimize_prompt(
+            task_id=task.task_id,
+            title=task.title,
+            description=task.description,
+            target_files=task.files,
+            memory_block=context_block,
+            handoff_block=compressed_handoff,
+            complexity=task.complexity,
+            workspace=self._workspace,
+        )
+
+        return optimized_prompt, memory_refs, report.options_applied
 
     def _resolve_execution_options(self, task: Task, session_id: str) -> dict[str, Any]:
         """Least-privilege options.
@@ -244,7 +273,11 @@ class SwarmWorkerPool:
     # ------------------------------------------------------------------
     # Execution
     # ------------------------------------------------------------------
-    def execute_task(self, task: Task) -> TaskExecutionResult:
+    def execute_task(
+        self,
+        task: Task,
+        attempted_agents: list[str] | None = None,
+    ) -> TaskExecutionResult:
         """Execute a single task synchronously on its assigned agent."""
         agent_id = task.assigned_agent or "antigravity-account-1"
 
@@ -540,9 +573,15 @@ class SwarmWorkerPool:
                     session_id=session_id,
                 )
 
+        is_heavy = task.complexity in ("reasoning", "strong") or agent_id in ("antigravity-account-1", "antigravity-account-2")
+        if is_heavy:
+            with self._heavy_lock:
+                self._active_heavy_tasks += 1
+
         try:
-            prompt, memory_refs = self._build_prompt(task)
+            prompt, memory_refs, opt_options = self._build_prompt(task)
             options = self._resolve_execution_options(task, session_id)
+            options.update(opt_options)
 
             self._event_bus.publish(
                 EventType.TASK_EXECUTION_REQUESTED,
@@ -679,13 +718,73 @@ class SwarmWorkerPool:
                 },
             )
 
+            # Record token usage honestly via TokenTelemetryTracker
+            self._token_tracker.record_usage(
+                task_id=task.task_id,
+                agent_id=agent_id,
+                account_id=adapter.account_id,
+                provider=adapter.provider,
+                requested_model=task.assigned_model,
+                actual_model=result.actual_model,
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+                total_tokens=result.total_tokens,
+                cache_read_tokens=result.cache_read_tokens,
+                duration_seconds=result.duration_seconds,
+                task_type=task.task_type,
+                complexity=task.complexity,
+                success=result.success,
+                raw_response=result.raw_response,
+            )
+
             if result.success:
                 self._on_success(task, adapter, agent_id, session_id, result, memory_refs, worktree_record)
             else:
+                self._emit(
+                    "failed",
+                    EventType.TASK_EXECUTION_FAILED,
+                    adapter,
+                    agent_id,
+                    task.task_id,
+                    session_id,
+                    {
+                        "error": (result.error or "")[:500],
+                        "exit_code": result.exit_code,
+                        "provider_status": result.provider_status,
+                    },
+                )
+                # Check for failover opportunity (e.g. Rate limit, quota, timeout, CLI error)
+                attempted = list(attempted_agents or [agent_id])
+                failover_dec = self._failover_manager.evaluate_failover(
+                    task=task,
+                    failed_agent_id=agent_id,
+                    error_text=result.error or "",
+                    exit_code=result.exit_code,
+                    attempted_agents=attempted,
+                )
+                if failover_dec.should_failover and failover_dec.fallback_agent_id:
+                    fallback_agent = failover_dec.fallback_agent_id
+                    if worktree_record and not result.files_touched:
+                        try:
+                            self._worktree_manager.cleanup(task.task_id)
+                        except Exception:
+                            pass
+                    task.assigned_agent = fallback_agent
+                    fb_adapter = self._registry.get_adapter(fallback_agent)
+                    if fb_adapter:
+                        task.assigned_account = fb_adapter.account_id
+                    for lf in locked_files:
+                        self._file_locker.release(lf, agent_id=agent_id)
+                    locked_files.clear()
+                    return self.execute_task(task, attempted_agents=attempted + [fallback_agent])
+
                 self._on_failure(task, adapter, agent_id, session_id, result, worktree_record)
 
             return result
         finally:
+            if is_heavy:
+                with self._heavy_lock:
+                    self._active_heavy_tasks = max(0, self._active_heavy_tasks - 1)
             for lf in locked_files:
                 self._file_locker.release(lf, agent_id=agent_id)
                 self._event_bus.publish(
@@ -1089,7 +1188,20 @@ class SwarmWorkerPool:
             return []
 
         results: list[TaskExecutionResult] = []
-        batch = ready_tasks[: self._max_workers]
+        # Ensure at most 1 heavy task runs concurrently on the 2-core host
+        heavy_seen = False
+        selected_batch: list[Task] = []
+        for t in ready_tasks:
+            is_heavy = t.complexity in ("reasoning", "strong") or t.assigned_agent in ("antigravity-account-1", "antigravity-account-2")
+            if is_heavy:
+                if not heavy_seen:
+                    selected_batch.append(t)
+                    heavy_seen = True
+            else:
+                selected_batch.append(t)
+            if len(selected_batch) >= self._max_workers:
+                break
+        batch = selected_batch or ready_tasks[: self._max_workers]
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=self._max_workers) as executor:
             future_to_task = {executor.submit(self.execute_task, t): t for t in batch}
