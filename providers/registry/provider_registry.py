@@ -101,6 +101,24 @@ class ProviderRegistry:
                     active.append(adapter)
         return active
 
+    def discover_models(self, provider_id: str) -> list[str]:
+        """Discover available models across registered adapters for a provider."""
+        provider = self.get_provider(provider_id)
+        return provider.models if provider else []
+
+    def discover_capabilities(self, provider_id: str) -> list[str]:
+        """Discover declared capabilities across registered adapters for a provider."""
+        provider = self.get_provider(provider_id)
+        return [c.value for c in provider.capabilities] if provider else []
+
+    def authenticate(self, provider_id: str) -> bool:
+        """Verify authentication/usability for all adapters under a provider."""
+        provider = self.get_provider(provider_id)
+        if not provider:
+            return False
+        health = provider.health()
+        return health.get("healthy", False)
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize provider and agent status for the Mission Control dashboard."""
         out = {}

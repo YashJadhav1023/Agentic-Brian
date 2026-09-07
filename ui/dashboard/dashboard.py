@@ -242,7 +242,15 @@ class MissionControlHandler(BaseHTTPRequestHandler):
             self._serve_json({"memories": mems, "count": memory_store.count()})
         elif path == "/api/handoff":
             content = handoff_manager.get_current_handoff() or "No active handoff available."
-            self._serve_json({"markdown": content})
+            rec = handoff_manager.get_current_record()
+            self._serve_json({
+                "markdown": content,
+                "record": rec.to_dict() if rec else None,
+            })
+        elif path == "/api/metrics/tokens":
+            self._serve_json(orchestrator.swarm.token_tracker.get_metrics())
+        elif path == "/api/router/history":
+            self._serve_json({"history": orchestrator.router.get_routing_history(50)})
         elif path == "/api/git":
             self._serve_json(self._get_git_info())
         elif path == "/api/worktrees":
@@ -510,8 +518,15 @@ class MissionControlHandler(BaseHTTPRequestHandler):
                 agent_events = [e for e in events if e.agent_id == agent_id]
 
                 running = [t for t in agent_tasks if t.status == TaskStatus.RUNNING]
-                completed = [t for t in agent_tasks if t.status == TaskStatus.COMPLETED]
-                failed = [t for t in agent_tasks if t.status == TaskStatus.FAILED]
+                completed = [t for t in agent_tasks if t.status in (TaskStatus.COMPLETED, TaskStatus.VERIFICATION_COMPLETE)]
+                failed = [t for t in agent_tasks if t.status in (TaskStatus.FAILED, TaskStatus.DEPTH_LIMIT_REACHED, TaskStatus.BUDGET_EXHAUSTED, TaskStatus.CANCELLED)]
+                finished = completed + failed
+                success_rate = (len(completed) / len(finished) * 100.0) if finished else 100.0
+                durations = [t.duration_seconds for t in finished if t.duration_seconds and t.duration_seconds > 0]
+                avg_latency = (sum(durations) / len(durations)) if durations else 0.0
+
+                token_metrics = orchestrator.swarm.token_tracker.get_metrics()
+                token_info = token_metrics.get("by_agent", {}).get(agent_id, {})
 
                 if not account.get("healthy"):
                     display_status = "OFFLINE"
@@ -530,6 +545,10 @@ class MissionControlHandler(BaseHTTPRequestHandler):
                 account.update(
                     {
                         "display_status": display_status,
+                        "success_rate": round(success_rate, 1),
+                        "avg_latency": round(avg_latency, 2),
+                        "known_tokens": token_info.get("known_tokens", 0),
+                        "token_tasks": token_info.get("tasks", 0),
                         "current_task": {
                             "task_id": latest.task_id,
                             "title": latest.title,
@@ -583,14 +602,16 @@ class MissionControlHandler(BaseHTTPRequestHandler):
 
     def _get_system_status(self) -> dict[str, Any]:
         tasks = task_manager.list_tasks()
+        token_metrics = orchestrator.swarm.token_tracker.get_metrics()
         return {
             "tasks_count": len(tasks),
             "running_tasks": len([t for t in tasks if t.status == TaskStatus.RUNNING]),
-            "completed_tasks": len([t for t in tasks if t.status == TaskStatus.COMPLETED]),
-            "ready_tasks": len([t for t in tasks if t.status == TaskStatus.READY]),
-            "failed_tasks": len([t for t in tasks if t.status == TaskStatus.FAILED]),
+            "completed_tasks": len([t for t in tasks if t.status in (TaskStatus.COMPLETED, TaskStatus.VERIFICATION_COMPLETE)]),
+            "ready_tasks": len([t for t in tasks if t.status in (TaskStatus.READY, TaskStatus.BACKLOG)]),
+            "failed_tasks": len([t for t in tasks if t.status in (TaskStatus.FAILED, TaskStatus.DEPTH_LIMIT_REACHED, TaskStatus.BUDGET_EXHAUSTED, TaskStatus.CANCELLED)]),
             "memories_count": memory_store.count(),
             "agents": self._get_agents_runtime(),
+            "token_metrics": token_metrics,
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
 
@@ -662,6 +683,12 @@ class MissionControlHandler(BaseHTTPRequestHandler):
       <button onclick="showTab('tasks')" class="tab-btn w-full text-left px-3 py-2 rounded text-sm hover:bg-slate-800 text-slate-300 font-medium" data-tab="tasks">
         <i class="fa-solid fa-list-check mr-2 text-amber-400"></i> Tasks (Kanban)
       </button>
+      <button onclick="showTab('routing')" class="tab-btn w-full text-left px-3 py-2 rounded text-sm hover:bg-slate-800 text-slate-300 font-medium" data-tab="routing">
+        <i class="fa-solid fa-route mr-2 text-yellow-400"></i> Routing Decisions
+      </button>
+      <button onclick="showTab('tokens')" class="tab-btn w-full text-left px-3 py-2 rounded text-sm hover:bg-slate-800 text-slate-300 font-medium" data-tab="tokens">
+        <i class="fa-solid fa-coins mr-2 text-emerald-400"></i> Tokens & Cost
+      </button>
       <button onclick="showTab('worktrees')" class="tab-btn w-full text-left px-3 py-2 rounded text-sm hover:bg-slate-800 text-slate-300 font-medium" data-tab="worktrees">
         <i class="fa-solid fa-shield-halved mr-2 text-emerald-400"></i> Worktree Sandboxes
       </button>
@@ -686,17 +713,23 @@ class MissionControlHandler(BaseHTTPRequestHandler):
     <main class="flex-1 overflow-y-auto p-8 bg-slate-950">
       <!-- DASHBOARD TAB -->
       <section id="tab-dashboard" class="tab-pane block space-y-6">
-        <h2 class="text-xl font-bold text-white mb-4">Mission Overview</h2>
+        <div class="flex items-center justify-between">
+          <h2 class="text-xl font-bold text-white">Mission Overview</h2>
+          <div class="px-3 py-1 bg-slate-900 border border-slate-800 rounded text-xs text-slate-400 font-mono">
+            Host: <span class="text-emerald-400">CachyOS Linux (2 Cores / 16GB)</span> | Workers: <span class="text-cyan-400">Max 2</span> | Heavy: <span class="text-amber-400">Max 1</span>
+          </div>
+        </div>
+
         <div class="grid grid-cols-4 gap-4">
           <div class="bg-slate-900 border border-slate-800 p-4 rounded-lg">
             <div class="text-xs text-slate-400 font-medium uppercase">Active Agents</div>
             <div id="stat-agents" class="text-2xl font-bold text-emerald-400 mt-1">4 Online</div>
-            <div class="text-[11px] text-slate-500 mt-1">Kiro, Cline, Antigravity 1 & 2</div>
+            <div class="text-[11px] text-slate-500 mt-1">AG-1, AG-2 (Headless), Kiro, Cline</div>
           </div>
           <div class="bg-slate-900 border border-slate-800 p-4 rounded-lg">
             <div class="text-xs text-slate-400 font-medium uppercase">Running Tasks</div>
             <div id="stat-running" class="text-2xl font-bold text-cyan-400 mt-1">0</div>
-            <div class="text-[11px] text-slate-500 mt-1">Bounded Concurrency: Max 2</div>
+            <div class="text-[11px] text-slate-500 mt-1">Resource Guard: Max 2 Concurrent</div>
           </div>
           <div class="bg-slate-900 border border-slate-800 p-4 rounded-lg">
             <div class="text-xs text-slate-400 font-medium uppercase">Completed Tasks</div>
@@ -704,9 +737,9 @@ class MissionControlHandler(BaseHTTPRequestHandler):
             <div class="text-[11px] text-slate-500 mt-1">Verified on Disk</div>
           </div>
           <div class="bg-slate-900 border border-slate-800 p-4 rounded-lg">
-            <div class="text-xs text-slate-400 font-medium uppercase">Shared Memories</div>
-            <div id="stat-memory" class="text-2xl font-bold text-amber-400 mt-1">0</div>
-            <div class="text-[11px] text-slate-500 mt-1">Scoped & Filtered</div>
+            <div class="text-xs text-slate-400 font-medium uppercase">Tracked Tokens</div>
+            <div id="stat-tokens" class="text-2xl font-bold text-amber-400 mt-1">0</div>
+            <div id="stat-tokens-sub" class="text-[11px] text-slate-500 mt-1">0 verified | 0 unverified</div>
           </div>
         </div>
 
@@ -716,11 +749,11 @@ class MissionControlHandler(BaseHTTPRequestHandler):
             <i class="fa-solid fa-paper-plane text-emerald-400"></i> Dispatch Instruction to Swarm
           </h3>
           <div class="flex gap-3">
-            <input id="quick-instruction" type="text" placeholder="e.g. Restructure telemetry helpers across services..." class="flex-1 bg-slate-950 border border-slate-700 rounded px-4 py-2 text-sm text-white focus:outline-none focus:border-emerald-500">
+            <input id="quick-instruction" type="text" placeholder="e.g. Optimize context telemetry helpers across services..." class="flex-1 bg-slate-950 border border-slate-700 rounded px-4 py-2 text-sm text-white focus:outline-none focus:border-emerald-500">
             <select id="quick-agent" class="bg-slate-950 border border-slate-700 rounded px-3 py-2 text-sm text-slate-300">
               <option value="">Smart Router (Auto)</option>
               <option value="antigravity-account-1">Antigravity Account 1 (CLI)</option>
-              <option value="antigravity-account-2">Antigravity Account 2 (IDE)</option>
+              <option value="antigravity-account-2">Antigravity Account 2 (Headless IDE Profile)</option>
               <option value="kiro-cli">Kiro CLI</option>
               <option value="cline">Cline CLI</option>
             </select>
@@ -734,7 +767,7 @@ class MissionControlHandler(BaseHTTPRequestHandler):
       <!-- AGENTS TAB -->
       <section id="tab-agents" class="tab-pane hidden space-y-6">
         <h2 class="text-xl font-bold text-white mb-2">Agent & Account Registry</h2>
-        <p class="text-sm text-slate-400 mb-6">Each execution resource is isolated. Antigravity Account 1 and Account 2 maintain distinct profiles and data directories.</p>
+        <p class="text-sm text-slate-400 mb-6">Each execution resource is isolated. Antigravity Account 1 and Account 2 maintain distinct profiles. Account 2 executes headlessly via <code class="text-emerald-400">agy --app_data_dir=antigravity-ide</code> without opening the GUI.</p>
         <div id="agents-grid" class="grid grid-cols-2 gap-4">
           <!-- Dynamically populated -->
         </div>
@@ -743,7 +776,7 @@ class MissionControlHandler(BaseHTTPRequestHandler):
       <!-- TASKS TAB -->
       <section id="tab-tasks" class="tab-pane hidden space-y-6">
         <h2 class="text-xl font-bold text-white mb-4">Task Lifecycle (Kanban)</h2>
-        <div class="grid grid-cols-3 gap-4">
+        <div class="grid grid-cols-4 gap-4">
           <div class="bg-slate-900 border border-slate-800 rounded-lg p-3">
             <h3 class="text-xs font-semibold uppercase text-slate-400 mb-3 flex items-center justify-between">
               <span>Ready Queue</span>
@@ -764,6 +797,90 @@ class MissionControlHandler(BaseHTTPRequestHandler):
               <span id="badge-completed" class="px-2 py-0.5 rounded bg-emerald-950 text-emerald-300 text-[10px]">0</span>
             </h3>
             <div id="tasks-completed" class="space-y-2"></div>
+          </div>
+          <div class="bg-slate-900 border border-slate-800 rounded-lg p-3">
+            <h3 class="text-xs font-semibold uppercase text-red-400 mb-3 flex items-center justify-between">
+              <span>Terminal / Failed</span>
+              <span id="badge-failed" class="px-2 py-0.5 rounded bg-red-950 text-red-300 text-[10px]">0</span>
+            </h3>
+            <div id="tasks-failed" class="space-y-2"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ROUTING DECISIONS TAB -->
+      <section id="tab-routing" class="tab-pane hidden space-y-6">
+        <div class="flex items-center justify-between">
+          <div>
+            <h2 class="text-xl font-bold text-white mb-1">Intelligent Multi-Factor Routing</h2>
+            <p class="text-sm text-slate-400">Explainable scoring: Capability (0.30) + Complexity (0.20) + Reliability (0.20) + Latency (0.15) + Token Efficiency (0.10) + Health (0.05).</p>
+          </div>
+          <button onclick="refreshData()" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 rounded text-xs transition flex items-center gap-1.5">
+            <i class="fa-solid fa-arrows-rotate"></i> Refresh Decisions
+          </button>
+        </div>
+        <div class="bg-slate-900 border border-slate-800 rounded-lg overflow-hidden">
+          <table class="w-full text-left text-xs">
+            <thead class="bg-slate-950 text-slate-400 uppercase border-b border-slate-800">
+              <tr>
+                <th class="p-3">Time</th>
+                <th class="p-3">Task Instruction</th>
+                <th class="p-3">Selected Agent</th>
+                <th class="p-3">Model</th>
+                <th class="p-3">Reason & Breakdown</th>
+              </tr>
+            </thead>
+            <tbody id="routing-history-tbody" class="divide-y divide-slate-800 font-mono">
+              <tr><td colspan="5" class="p-4 text-center text-slate-500 font-sans">Loading routing history...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- TOKENS & COST TAB -->
+      <section id="tab-tokens" class="tab-pane hidden space-y-6">
+        <div class="flex items-center justify-between">
+          <div>
+            <h2 class="text-xl font-bold text-white mb-1">Token & Cost Telemetry</h2>
+            <p class="text-sm text-slate-400">Auditable token consumption. Unverified CLI runs are strictly classified as UNKNOWN (Never invented).</p>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-3 gap-4">
+          <div class="bg-slate-900 border border-slate-800 p-4 rounded-lg">
+            <div class="text-xs text-slate-400 font-medium uppercase">Verified Tokens</div>
+            <div id="tokens-known-val" class="text-2xl font-bold text-emerald-400 mt-1">0</div>
+            <div class="text-[11px] text-slate-500 mt-1">Directly reported by API / adapter</div>
+          </div>
+          <div class="bg-slate-900 border border-slate-800 p-4 rounded-lg">
+            <div class="text-xs text-slate-400 font-medium uppercase">Unverified Runs</div>
+            <div id="tokens-unknown-val" class="text-2xl font-bold text-amber-400 mt-1">0</div>
+            <div class="text-[11px] text-slate-500 mt-1">CLI processes with no telemetry header</div>
+          </div>
+          <div class="bg-slate-900 border border-slate-800 p-4 rounded-lg">
+            <div class="text-xs text-slate-400 font-medium uppercase">Total Executions</div>
+            <div id="tokens-total-val" class="text-2xl font-bold text-cyan-400 mt-1">0</div>
+            <div class="text-[11px] text-slate-500 mt-1">Tracked across all 4 agents</div>
+          </div>
+        </div>
+
+        <div class="bg-slate-900 border border-slate-800 rounded-lg p-5 space-y-3">
+          <h3 class="text-sm font-semibold text-white">Breakdown by Agent</h3>
+          <div class="overflow-x-auto">
+            <table class="w-full text-left text-xs font-mono">
+              <thead class="bg-slate-950 text-slate-400 uppercase border-b border-slate-800 font-sans">
+                <tr>
+                  <th class="p-3">Agent</th>
+                  <th class="p-3">Total Runs</th>
+                  <th class="p-3">Verified Tokens</th>
+                  <th class="p-3">Avg Latency</th>
+                  <th class="p-3">Successes</th>
+                </tr>
+              </thead>
+              <tbody id="tokens-agent-tbody" class="divide-y divide-slate-800">
+                <tr><td colspan="5" class="p-4 text-center text-slate-500 font-sans">No telemetry records logged yet.</td></tr>
+              </tbody>
+            </table>
           </div>
         </div>
       </section>
@@ -798,26 +915,44 @@ class MissionControlHandler(BaseHTTPRequestHandler):
 
       <!-- FLOW TAB -->
       <section id="tab-flow" class="tab-pane hidden space-y-6">
-        <h2 class="text-xl font-bold text-white mb-2">Autonomous Execution Flow</h2>
-        <div class="bg-slate-900 border border-slate-800 rounded-lg p-6 font-mono text-sm text-slate-300 space-y-4">
-          <div class="flex items-center gap-3">
-            <div class="px-3 py-1.5 bg-indigo-950 border border-indigo-700 text-indigo-300 rounded">1. USER / PROMPT</div>
-            <i class="fa-solid fa-arrow-right text-slate-500"></i>
-            <div class="px-3 py-1.5 bg-emerald-950 border border-emerald-700 text-emerald-300 rounded">2. SHARED BRAIN</div>
-            <i class="fa-solid fa-arrow-right text-slate-500"></i>
-            <div class="px-3 py-1.5 bg-cyan-950 border border-cyan-700 text-cyan-300 rounded">3. SMART ROUTER</div>
+        <h2 class="text-xl font-bold text-white mb-2">Autonomous Swarm Execution Flow</h2>
+        <div class="bg-slate-900 border border-slate-800 rounded-lg p-6 font-mono text-xs text-slate-300 space-y-4">
+          <div class="grid grid-cols-4 gap-3 text-center">
+            <div class="p-3 bg-indigo-950/80 border border-indigo-700 text-indigo-300 rounded">
+              <div class="font-bold mb-1">1. USER / PROMPT</div>
+              <div class="text-[10px] text-slate-400 font-sans">Task dispatch or Universal Continue</div>
+            </div>
+            <div class="p-3 bg-emerald-950/80 border border-emerald-700 text-emerald-300 rounded">
+              <div class="font-bold mb-1">2. SHARED BRAIN</div>
+              <div class="text-[10px] text-slate-400 font-sans">Session, continuator & scope retrieval</div>
+            </div>
+            <div class="p-3 bg-cyan-950/80 border border-cyan-700 text-cyan-300 rounded">
+              <div class="font-bold mb-1">3. SMART ROUTER</div>
+              <div class="text-[10px] text-slate-400 font-sans">6-factor scoring, failover order</div>
+            </div>
+            <div class="p-3 bg-amber-950/80 border border-amber-700 text-amber-300 rounded">
+              <div class="font-bold mb-1">4. CONTEXT OPTIMIZER</div>
+              <div class="text-[10px] text-slate-400 font-sans">Scoping, dedup & token budgeting</div>
+            </div>
           </div>
-          <div class="pl-12 border-l-2 border-slate-800 space-y-2 py-2">
-            <div class="text-xs text-slate-400">├── Task Analysis (Complexity, Action, Risk, Capabilities)</div>
-            <div class="text-xs text-slate-400">├── Agent Selection (Account 1, Account 2, Kiro, Cline)</div>
-            <div class="text-xs text-slate-400">└── Model Policy (Frontier, Advanced, Balanced, Fast)</div>
-          </div>
-          <div class="flex items-center gap-3">
-            <div class="px-3 py-1.5 bg-amber-950 border border-amber-700 text-amber-300 rounded">4. SWARM WORKER</div>
-            <i class="fa-solid fa-arrow-right text-slate-500"></i>
-            <div class="px-3 py-1.5 bg-purple-950 border border-purple-700 text-purple-300 rounded">5. WORKTREE SANDBOX & DIFF</div>
-            <i class="fa-solid fa-arrow-right text-slate-500"></i>
-            <div class="px-3 py-1.5 bg-emerald-950 border border-emerald-700 text-emerald-300 rounded">6. HUMAN APPROVAL & MERGE</div>
+
+          <div class="grid grid-cols-4 gap-3 text-center pt-2">
+            <div class="p-3 bg-blue-950/80 border border-blue-700 text-blue-300 rounded">
+              <div class="font-bold mb-1">5. AGENT ADAPTER</div>
+              <div class="text-[10px] text-slate-400 font-sans">AG-1, Headless AG-2, Kiro, Cline</div>
+            </div>
+            <div class="p-3 bg-yellow-950/80 border border-yellow-700 text-yellow-300 rounded">
+              <div class="font-bold mb-1">6. FAILOVER GUARD</div>
+              <div class="text-[10px] text-slate-400 font-sans">AG-1 ⇄ AG-2 on quota / rate limit</div>
+            </div>
+            <div class="p-3 bg-purple-950/80 border border-purple-700 text-purple-300 rounded">
+              <div class="font-bold mb-1">7. VERIFICATION</div>
+              <div class="text-[10px] text-slate-400 font-sans">Bounded depth &le; 1, non-recursive</div>
+            </div>
+            <div class="p-3 bg-emerald-950/80 border border-emerald-700 text-emerald-300 rounded">
+              <div class="font-bold mb-1">8. WORKTREE MERGE</div>
+              <div class="text-[10px] text-slate-400 font-sans">Human gate or auto-merge on safe verify</div>
+            </div>
           </div>
         </div>
       </section>
@@ -830,7 +965,13 @@ class MissionControlHandler(BaseHTTPRequestHandler):
 
       <!-- HANDOFFS TAB -->
       <section id="tab-handoffs" class="tab-pane hidden space-y-4">
-        <h2 class="text-xl font-bold text-white mb-2">Structured Handoff Viewer</h2>
+        <div class="flex items-center justify-between">
+          <h2 class="text-xl font-bold text-white">Structured Handoff Viewer</h2>
+          <span class="text-xs text-slate-500 font-mono">Bounded Context Delivery</span>
+        </div>
+        <div id="handoff-card" class="bg-slate-900 border border-slate-800 p-4 rounded-lg space-y-2 text-xs">
+          <!-- Structured metadata -->
+        </div>
         <div id="handoff-content" class="bg-slate-900 border border-slate-800 p-6 rounded-lg font-sans text-sm prose prose-invert max-w-none">
           Loading handoff...
         </div>
@@ -907,6 +1048,17 @@ class MissionControlHandler(BaseHTTPRequestHandler):
         document.getElementById('stat-completed').textContent = status.completed_tasks;
         document.getElementById('stat-memory').textContent = status.memories_count;
 
+        // Render Tokens summary
+        const tm = status.token_metrics || { known_tokens: 0, unknown_count: 0, total_tasks: 0 };
+        document.getElementById('stat-tokens').textContent = tm.known_tokens.toLocaleString();
+        document.getElementById('stat-tokens-sub').textContent = tm.total_tasks + ' runs (' + tm.unknown_count + ' unverified)';
+        const tkVal = document.getElementById('tokens-known-val');
+        if (tkVal) tkVal.textContent = tm.known_tokens.toLocaleString();
+        const tuVal = document.getElementById('tokens-unknown-val');
+        if (tuVal) tuVal.textContent = tm.unknown_count;
+        const ttVal = document.getElementById('tokens-total-val');
+        if (ttVal) ttVal.textContent = tm.total_tasks;
+
         // Render Agents
         const grid = document.getElementById('agents-grid');
         grid.innerHTML = '';
@@ -933,45 +1085,163 @@ class MissionControlHandler(BaseHTTPRequestHandler):
                 </div>
                 <span class="text-[10px] px-2 py-0.5 rounded font-mono ${statusColors[st] || statusColors.OFFLINE}">${st}</span>
               </div>
-              <div class="text-xs text-slate-400">Account: <span class="text-slate-200">${a.account_id}</span> | Provider: <span class="text-slate-200">${a.provider}</span> | <span class="font-mono text-[10px]">${a.execution_mode}</span></div>
+              <div class="text-xs text-slate-400">Account: <span class="text-slate-200">${a.account_id}</span> | Provider: <span class="text-slate-200">${a.provider}</span></div>
+              <div class="text-[10px] text-cyan-400 font-mono">Mode: ${a.execution_mode || 'CLI Subprocess'}</div>
               ${a.profile ? `<div class="text-[10px] text-slate-500 font-mono truncate">Profile: ${a.profile}</div>` : ''}
               <div class="text-[11px] text-slate-500">Health: ${a.health_reason}</div>
               <div class="text-[11px] text-slate-400">Current task: ${cur ? `<span class="text-slate-200">${cur.title.slice(0, 42)}</span> <span class="font-mono text-[10px] text-slate-500">(${cur.status})</span>` : '<span class="text-slate-600">none</span>'}</div>
               <div class="text-[11px] text-slate-400">Model: <span class="font-mono text-emerald-400">${cur ? (cur.requested_model || 'auto') : (a.default_model || 'auto')}</span>${cur && cur.reported_model ? ` <span class="text-slate-500">(reported: ${cur.reported_model})</span>` : ''}</div>
-              <div class="text-[10px] text-slate-500 font-mono truncate">Session: ${a.session_id || '-'}</div>
-              <div class="text-[10px] text-slate-500 font-mono truncate">Conversation: ${a.conversation_id || '-'}</div>
-              <div class="text-[10px] text-slate-500">Duration: ${cur && cur.duration_seconds ? cur.duration_seconds.toFixed(2) + 's' : '-'} | Last activity: ${a.last_activity ? a.last_activity.slice(0, 19).replace('T', ' ') : '-'}</div>
-              <div class="text-[10px] text-slate-400">Tasks: ${c.total} total, <span class="text-emerald-400">${c.completed} done</span>, <span class="text-red-400">${c.failed} failed</span></div>
+              <div class="text-[10px] text-slate-500">Success: <span class="text-emerald-400 font-mono">${a.success_rate || 100}%</span> | Avg Latency: <span class="text-slate-300 font-mono">${a.avg_latency || 0}s</span> | Known Tokens: <span class="text-amber-400 font-mono">${(a.known_tokens || 0).toLocaleString()}</span></div>
+              <div class="text-[10px] text-slate-400">Tasks: ${c.total} total, <span class="text-emerald-400">${c.completed} done</span>, <span class="text-red-400">${c.failed} terminal</span></div>
               ${(a.recent_errors && a.recent_errors.length) ? `<div class="text-[10px] text-red-400/80 truncate" title="${a.recent_errors[0].replace(/"/g, '')}">Last error: ${a.recent_errors[0].slice(0, 60)}</div>` : ''}
-              <div class="text-[11px] text-slate-400">Models (${a.models.length}): <span class="font-mono text-emerald-400">${a.models.slice(0, 3).join(', ')}${a.models.length > 3 ? ' ...' : ''}</span></div>
             `;
             grid.appendChild(card);
           }
         }
 
-        // Render Tasks
+        // Render Tasks (Kanban)
         const resTasks = await fetch('/api/tasks');
         const tasksData = await resTasks.json();
         const readyDiv = document.getElementById('tasks-ready');
         const runningDiv = document.getElementById('tasks-running');
         const compDiv = document.getElementById('tasks-completed');
-        readyDiv.innerHTML = ''; runningDiv.innerHTML = ''; compDiv.innerHTML = '';
+        const failedDiv = document.getElementById('tasks-failed');
+        readyDiv.innerHTML = ''; runningDiv.innerHTML = ''; compDiv.innerHTML = ''; failedDiv.innerHTML = '';
 
-        let cReady = 0, cRun = 0, cDone = 0;
+        let cReady = 0, cRun = 0, cDone = 0, cFail = 0;
         for (const t of tasksData.tasks) {
           const item = document.createElement('div');
           item.className = 'p-3 bg-slate-950 border border-slate-800 rounded text-xs space-y-1';
           item.innerHTML = `
             <div class="font-semibold text-slate-200">${t.title}</div>
             <div class="text-slate-500 text-[10px] font-mono">Agent: ${t.assigned_agent || 'auto'} | Model: ${t.assigned_model || 'auto'}</div>
+            <div class="flex items-center justify-between text-[10px] text-slate-600 font-mono pt-1">
+              <span>${t.task_id}</span>
+              <span>${t.duration_seconds ? t.duration_seconds.toFixed(2) + 's' : ''}</span>
+            </div>
           `;
-          if (t.status === 'READY') { readyDiv.appendChild(item); cReady++; }
-          else if (t.status === 'RUNNING') { runningDiv.appendChild(item); cRun++; }
-          else if (t.status === 'COMPLETED') { compDiv.appendChild(item); cDone++; }
+          if (t.status === 'READY' || t.status === 'BACKLOG') { readyDiv.appendChild(item); cReady++; }
+          else if (t.status === 'RUNNING' || t.status === 'PLANNING') { runningDiv.appendChild(item); cRun++; }
+          else if (t.status === 'COMPLETED' || t.status === 'VERIFICATION_COMPLETE') { compDiv.appendChild(item); cDone++; }
+          else { failedDiv.appendChild(item); cFail++; }
         }
         document.getElementById('badge-ready').textContent = cReady;
         document.getElementById('badge-running').textContent = cRun;
         document.getElementById('badge-completed').textContent = cDone;
+        document.getElementById('badge-failed').textContent = cFail;
+
+        // Render Routing History
+        const resRouting = await fetch('/api/router/history');
+        if (resRouting.ok) {
+          const routingData = await resRouting.json();
+          const rBody = document.getElementById('routing-history-tbody');
+          if (rBody && routingData.history) {
+            rBody.innerHTML = '';
+            if (routingData.history.length === 0) {
+              rBody.innerHTML = '<tr><td colspan="5" class="p-4 text-center text-slate-500 font-sans">No routing decisions recorded yet.</td></tr>';
+            } else {
+              for (const entry of routingData.history) {
+                const tr = document.createElement('tr');
+                const tShort = (entry.timestamp || '').split('T')[1]?.slice(0, 8) || '-';
+                tr.innerHTML = `
+                  <td class="p-3 text-slate-500">${tShort}</td>
+                  <td class="p-3 text-slate-300 font-sans">${(entry.task_text || '').slice(0, 40)}</td>
+                  <td class="p-3 text-emerald-400 font-semibold">${entry.selected_agent}</td>
+                  <td class="p-3 text-slate-400">${entry.selected_model || 'auto'}</td>
+                  <td class="p-3 text-slate-400 font-sans text-[11px]">${entry.reason || ''}</td>
+                `;
+                rBody.appendChild(tr);
+              }
+            }
+          }
+        }
+
+        // Render Tokens breakdown table
+        const tBody = document.getElementById('tokens-agent-tbody');
+        if (tBody && tm.by_agent) {
+          tBody.innerHTML = '';
+          for (const [aId, d] of Object.entries(tm.by_agent)) {
+            const avgDur = d.tasks ? (d.total_duration / d.tasks).toFixed(2) + 's' : '-';
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+              <td class="p-3 text-white font-semibold">${aId}</td>
+              <td class="p-3 text-slate-300">${d.tasks}</td>
+              <td class="p-3 text-amber-400">${(d.known_tokens || 0).toLocaleString()}</td>
+              <td class="p-3 text-slate-400">${avgDur}</td>
+              <td class="p-3 text-emerald-400">${d.success_count || 0}</td>
+            `;
+            tBody.appendChild(tr);
+          }
+        }
+
+        // Render Worktrees
+        await renderWorktrees();
+
+        // Render Memories
+        const resMem = await fetch('/api/memory');
+        const memData = await resMem.json();
+        const memList = document.getElementById('memory-list');
+        memList.innerHTML = '';
+        for (const m of memData.memories) {
+          const mItem = document.createElement('div');
+          mItem.className = 'p-3 bg-slate-900 border border-slate-800 rounded text-xs space-y-1';
+          mItem.innerHTML = `
+            <div class="flex justify-between text-[10px] text-slate-500 font-mono">
+              <span class="px-1.5 py-0.5 rounded bg-slate-800 text-purple-300">[${m.scope}] Source: ${m.source_agent}</span>
+              <span>Importance: ${m.importance}/5</span>
+            </div>
+            <div class="text-slate-200 font-sans">${m.content}</div>
+          `;
+          memList.appendChild(mItem);
+        }
+
+        // Render Handoff
+        const resHandoff = await fetch('/api/handoff');
+        const handoffData = await resHandoff.json();
+        const hCard = document.getElementById('handoff-card');
+        if (hCard && handoffData.record) {
+          const hr = handoffData.record;
+          hCard.innerHTML = `
+            <div class="flex items-center justify-between border-b border-slate-800 pb-2">
+              <div><span class="text-slate-400">Flow:</span> <span class="text-emerald-400 font-mono">${hr.source_agent}</span> → <span class="text-cyan-400 font-mono">${hr.destination_agent || 'Brain'}</span></div>
+              <div class="font-mono text-[10px] text-slate-500">${hr.created_at || ''}</div>
+            </div>
+            <div><span class="text-slate-400 font-semibold">Summary:</span> <span class="text-slate-200">${hr.summary}</span></div>
+            ${hr.next_action ? `<div><span class="text-amber-400 font-semibold">Next Action:</span> <span class="text-slate-300">${hr.next_action}</span></div>` : ''}
+          `;
+          hCard.classList.remove('hidden');
+        } else if (hCard) {
+          hCard.classList.add('hidden');
+        }
+        document.getElementById('handoff-content').innerHTML = marked.parse(handoffData.markdown || 'No active handoff.');
+
+        // Render Events
+        const resEvents = await fetch('/api/events');
+        const eventsData = await resEvents.json();
+        const evList = document.getElementById('events-list');
+        evList.innerHTML = '';
+        for (const e of eventsData.events.slice(0, 30)) {
+          const evItem = document.createElement('div');
+          evItem.className = 'p-2 bg-slate-900 border border-slate-800 rounded flex justify-between';
+          evItem.innerHTML = `
+            <div><span class="text-emerald-400 font-bold">${e.event_type}</span> <span class="text-slate-400">${e.agent_id || ''} ${e.task_id || ''}</span></div>
+            <div class="text-slate-600">${e.timestamp.split('T')[1]?.slice(0, 8) || ''}</div>
+          `;
+          evList.appendChild(evItem);
+        }
+
+        // Render Git
+        const resGit = await fetch('/api/git');
+        const gitData = await resGit.json();
+        document.getElementById('git-badge').textContent = gitData.branch + '@' + gitData.commit;
+        document.getElementById('git-branch').textContent = gitData.branch;
+        document.getElementById('git-commit').textContent = gitData.commit;
+        document.getElementById('git-status-text').textContent = gitData.status;
+
+      } catch (err) {
+        console.error('Error refreshing data:', err);
+      }
+    }
 
         // Render Worktrees
         await renderWorktrees();
