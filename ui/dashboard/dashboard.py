@@ -945,7 +945,11 @@ class WizardManager:
 
         # OmniRoute-style persistence & active routing pool registration for ALL providers
         if sess.provider_id == "antigravity":
-            app_data_dir = sess.config.get("app_data_dir") or (sess.account.metadata.get("data_dir") if sess.account else sess.account_id)
+            app_data_dir = (
+                sess.config.get("app_data_dir")
+                or (sess.account.metadata.get("data_dir") if sess.account else None)
+                or (sess.account_id if sess.account_id.startswith("antigravity-account-") else f"antigravity-account-{sess.account_id.replace('antigravity-', '')}")
+            )
             email = sess.config.get("email") or (sess.account.metadata.get("email") if sess.account else "")
             desc = f"Antigravity account ({email})" if email else f"Antigravity account {sess.account_id}"
             acct.description = desc
@@ -956,6 +960,7 @@ class WizardManager:
                 "description": desc,
                 "priority": acct.priority,
                 "enabled": True,
+                "data_dir": app_data_dir,
                 "models": acct.models or ["gemini-3.8-flash-medium", "gemini-3.7-flash-high", "gemini-3.7-flash-medium"],
                 "default_model": (acct.models[0] if acct.models else "gemini-3.8-flash-medium"),
                 "capabilities": acct.capabilities,
@@ -3574,12 +3579,16 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
         # Persist into isolated profile directory
         mgr = AntigravityAuthManager()
         data_dir, profile_dir = mgr.create_isolated_profile(sess.account_id, sess.config.get("app_data_dir"))
-        token_file = profile_dir / TOKEN_FILENAME
+        now = datetime.datetime.now(datetime.timezone.utc)
+        expiry_str = (now + datetime.timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
         token_data_to_store = {
-            "token": primary_token,
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "auth_method": "oauth",
+            "token": {
+                "access_token": access_token or primary_token,
+                "token_type": "Bearer",
+                "refresh_token": refresh_token,
+                "expiry": expiry_str,
+            },
+            "auth_method": "consumer",
         }
         if id_token:
             token_data_to_store["id_token"] = id_token

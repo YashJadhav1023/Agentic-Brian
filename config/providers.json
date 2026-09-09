@@ -135,6 +135,38 @@
             "gpt-oss-120b-medium"
           ],
           "default_model": "gemini-3.8-flash-medium"
+        },
+        "antigravity-account-2077": {
+          "account_id": "account-2077",
+          "agent_id": "antigravity-account-2077",
+          "display_name": "antigravity-account-2077",
+          "description": "Antigravity account (yshj0707@gmail.com)",
+          "priority": 10,
+          "enabled": true,
+          "models": [
+            "gemini-3.8-flash-medium",
+            "gemini-3.7-flash-high",
+            "gemini-3.7-flash-medium",
+            "gemini-3.1-pro-high",
+            "claude-sonnet-4-6",
+            "claude-opus-4-6-thinking"
+          ],
+          "default_model": "gemini-3.8-flash-medium",
+          "data_dir": "antigravity-account-2077",
+          "capabilities": [
+            "architecture",
+            "deep-reasoning",
+            "documentation",
+            "governance",
+            "protocol-design"
+          ],
+          "execution": {
+            "command": "~/.gemini/bin/agy",
+            "app_data_dir": "antigravity-account-2077",
+            "output_format": "json",
+            "dangerously_skip_permissions": true,
+            "default_timeout_seconds": 300
+          }
         }
       }
     },
