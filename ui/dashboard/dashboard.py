@@ -6789,10 +6789,6 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
         if (isAntigravity) {
           setTimeout(wizCheckAuthStatus, 100);
         }
-          </div>`;
-        if (isAntigravity) {
-          setTimeout(wizCheckAuthStatus, 100);
-        }
       } else if (wizState.step === 'validate') {
         body.innerHTML = `<div class="text-slate-400">Run pre-flight validation (models discovery / connectivity). Lifecycle → VALIDATING → READY.</div>
           <label class="flex items-center gap-2 mt-2 text-[11px] text-slate-400"><input type="checkbox" id="wiz-live" checked> Perform a live validation probe</label>`;
