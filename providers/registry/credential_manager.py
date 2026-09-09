@@ -277,6 +277,11 @@ class SecretRedactor:
         re.compile(r"Bearer\s+([a-zA-Z0-9_\-\.]{16,})", re.I),
     ]
 
+    TELEMETRY_KEY_PATTERNS = re.compile(
+        r"(?:(?:^|_)tokens?$|_tokens|_tokens_usd|token_metrics|token_efficiency|token_count|known_tokens|total_tokens|input_tokens|output_tokens|prompt_tokens|completion_tokens|today_tokens|today_usage_tokens)",
+        re.I,
+    )
+
     def __init__(self) -> None:
         self._known_secrets: set[str] = set()
 
@@ -307,6 +312,9 @@ class SecretRedactor:
                 if key_name.lower() in self.NON_SECRET_KEY_ALLOWLIST:
                     # A reference or an enum: keep it, but still scrub the value
                     # in case real secret material was written into it.
+                    clean[k] = self.redact_dict(v)
+                elif self.TELEMETRY_KEY_PATTERNS.search(key_name) and key_name.lower() != "token":
+                    # LLM token usage counters and telemetry metrics, not secrets
                     clean[k] = self.redact_dict(v)
                 elif self.SENSITIVE_KEY_PATTERNS.search(key_name):
                     clean[k] = self.REDACTION_TOKEN

@@ -141,6 +141,30 @@ class TestSecretRedaction(unittest.TestCase):
         self.assertEqual(clean["nested"]["safe"], "keep-me")
         self.assertEqual(clean["items"][0]["token"], SecretRedactor.REDACTION_TOKEN)
 
+    def test_telemetry_token_counters_survive_redaction(self):
+        """Usage metrics and token counters must not be blanked to ***REDACTED***."""
+        payload = {
+            "total_tokens": 150000,
+            "input_tokens": 140000,
+            "output_tokens": 10000,
+            "today_tokens": 5000,
+            "today_usage_tokens": 5000,
+            "token_metrics": {
+                "known_tokens": 150000,
+                "unknown_count": 2,
+            },
+            "token_efficiency": 0.95,
+        }
+        clean = self.redactor.redact_dict(payload)
+        self.assertEqual(clean["total_tokens"], 150000)
+        self.assertEqual(clean["input_tokens"], 140000)
+        self.assertEqual(clean["output_tokens"], 10000)
+        self.assertEqual(clean["today_tokens"], 5000)
+        self.assertEqual(clean["today_usage_tokens"], 5000)
+        self.assertEqual(clean["token_metrics"]["known_tokens"], 150000)
+        self.assertEqual(clean["token_metrics"]["unknown_count"], 2)
+        self.assertEqual(clean["token_efficiency"], 0.95)
+
     def test_credential_reference_survives_redaction(self):
         """The reference URI is a pointer, not a secret.
 

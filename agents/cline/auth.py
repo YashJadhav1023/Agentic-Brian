@@ -109,7 +109,7 @@ class ClineAuthManager:
 
         version_str = "unknown"
         try:
-            res_v = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=20)
+            res_v = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL)
             if res_v.returncode == 0 and res_v.stdout.strip():
                 version_str = res_v.stdout.strip().splitlines()[0].strip()
         except Exception as e:
@@ -119,7 +119,7 @@ class ClineAuthManager:
         has_auth = False
         auth_flags: list[str] = []
         try:
-            res_auth = subprocess.run([exe, "auth", "--help"], capture_output=True, text=True, timeout=20)
+            res_auth = subprocess.run([exe, "auth", "--help"], capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL)
             if res_auth.returncode == 0:
                 has_auth = True
                 help_text = res_auth.stdout
@@ -135,7 +135,7 @@ class ClineAuthManager:
 
         if not (supports_config and supports_data_dir):
             try:
-                res_main = subprocess.run([exe, "--help"], capture_output=True, text=True, timeout=20)
+                res_main = subprocess.run([exe, "--help"], capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL)
                 if res_main.returncode == 0:
                     main_help = res_main.stdout
                     if "--config" in main_help:

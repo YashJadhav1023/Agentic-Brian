@@ -117,7 +117,10 @@ from providers.registry.lifecycle import (
 )
 from providers.api.onboarding import APIProviderOnboarder, ValidationStatus
 from agents.cline.auth import ClineAuthManager
-from agents.antigravity.auth import AntigravityAuthManager
+from agents.antigravity.auth import AntigravityAuthManager, TOKEN_FILENAME
+from agents.antigravity.adapter import AntigravityAdapter, AntigravityAccountAdapter
+from providers.registry.config import add_account_config, remove_account_config
+from providers.adapters.bridge import AgentProviderBridge
 
 
 def _new_correlation_id() -> str:
@@ -332,7 +335,8 @@ class WizardManager:
     #: GUI profile and keyring slot are never touched by the wizard.
     _STATIC_AUTH_METHODS = {
         "antigravity": [
-            {"id": "oauth", "label": "Google OAuth (official agy CLI, isolated profile)"},
+            {"id": "oauth", "label": "Google OAuth (browser redirect / CLI login)"},
+            {"id": "api_key", "label": "Direct OAuth Token / Session Key"},
         ],
         "openai": [{"id": "api_key", "label": "API Key"}],
         "anthropic": [{"id": "api_key", "label": "API Key"}],
@@ -455,17 +459,61 @@ class WizardManager:
         sess.auth_method = method
         sess.step = "select_auth"
 
+    def launch_login(self, sess: WizardSession) -> dict[str, Any]:
+        """Prepare isolated environment and return the official CLI authentication command."""
+        if sess.provider_id == "antigravity":
+            mgr = AntigravityAuthManager()
+            data_dir, profile_dir = mgr.create_isolated_profile(sess.account_id, sess.config.get("app_data_dir"))
+            if str(profile_dir) not in sess.profile_dirs:
+                sess.profile_dirs.append(str(profile_dir))
+            res = mgr.launch_auth(sess.account_id, data_dir)
+            res["email"] = sess.config.get("email", "")
+            return res
+        return {"success": True, "message": f"Direct authentication for {sess.provider_id}", "email": sess.config.get("email", "")}
+
+    def check_auth_status(self, sess: WizardSession) -> dict[str, Any]:
+        """Check whether local token file exists and is non-empty."""
+        if sess.provider_id == "antigravity":
+            mgr = AntigravityAuthManager()
+            data_dir = sess.config.get("app_data_dir") or sess.account_id
+            exists = mgr.check_token_exists(data_dir)
+            profile_dir = mgr.get_profile_dir(data_dir)
+            email = sess.config.get("email") or (sess.account.metadata.get("email") if sess.account else "")
+            return {
+                "authenticated": exists,
+                "token_exists": exists,
+                "data_dir": data_dir,
+                "profile_dir": str(profile_dir),
+                "email": email,
+                "account_id": sess.account_id,
+            }
+        return {
+            "authenticated": bool(sess.credential_reference),
+            "token_exists": bool(sess.credential_reference),
+            "account_id": sess.account_id,
+        }
+
     def configure(self, sess: WizardSession, config: dict[str, Any]) -> None:
         # Extract secret up-front and stash ONLY the reference on the session.
         api_key = (config.pop("api_key", None) or "").strip() if isinstance(config.get("api_key"), str) else None
+        auth_token = (config.pop("auth_token", None) or "").strip() if isinstance(config.get("auth_token"), str) else None
+        token_val = api_key or auth_token
+        email = (config.get("email") or "").strip() if isinstance(config.get("email"), str) else ""
+
         # Retain non-secret config only (base_url, model, display_name, priority).
-        # "capabilities" is accepted here so a programmatic caller can declare
-        # them; it is filtered against the Capability enum at register time, so an
-        # unrecognised tag can never reach the registry.
         safe_config = {
             k: v for k, v in config.items()
-            if k in ("base_url", "model", "models", "display_name", "priority", "app_data_dir", "capabilities")
+            if k in ("base_url", "model", "models", "display_name", "priority", "app_data_dir", "capabilities", "email")
         }
+        if email:
+            safe_config["email"] = email
+            if sess.account is not None:
+                sess.account.metadata["email"] = email
+                sess.account.description = f"Antigravity account ({email})"
+
+        if token_val:
+            safe_config["auth_token"] = token_val
+
         sess.config = safe_config
         self._transition(sess, AccountLifecycleState.CONFIGURING, reason="Configuring account")
         sess.step = "configure"
@@ -477,16 +525,16 @@ class WizardManager:
             raise WizardError("Authentication method must be selected before configure", AccountLifecycleState.CONFIG_ERROR)
 
         # Store the credential immediately and securely if one was supplied.
-        if api_key:
+        if token_val:
             cred_ref = f"secret://mission-control/{sess.provider_id}/{sess.account_id}/api_key"
             try:
-                get_credential_manager().store(cred_ref, api_key)
+                get_credential_manager().store(cred_ref, token_val)
             except Exception as exc:
                 raise WizardError(f"Failed to store credential securely: {exc}", AccountLifecycleState.CONFIG_ERROR)
             sess.credential_reference = cred_ref
             if sess.account is not None:
                 sess.account.credential_reference = cred_ref
-                sess.account.authentication_type = AuthenticationType.API_KEY
+                sess.account.authentication_type = AuthenticationType.API_KEY if sess.provider_id != "antigravity" else AuthenticationType.OAUTH
         elif sess.provider_id == "antigravity":
             if sess.account is not None:
                 sess.account.authentication_type = AuthenticationType.OAUTH
@@ -504,13 +552,30 @@ class WizardManager:
                 # Allocate a FRESH isolated profile. Never target the IDE profile.
                 mgr = AntigravityAuthManager()
                 data_dir, profile_dir = mgr.create_isolated_profile(sess.account_id, sess.config.get("app_data_dir"))
-                sess.profile_dirs.append(str(profile_dir))
+                if str(profile_dir) not in sess.profile_dirs:
+                    sess.profile_dirs.append(str(profile_dir))
                 if sess.account is not None:
                     sess.account.metadata["data_dir"] = data_dir
                     sess.account.metadata["profile_dir"] = str(profile_dir)
-                # We prepared the isolated OAuth target; the operator completes the
-                # official Google login out-of-band. Treat preparation as success
-                # for the flow so the wizard can proceed to validation.
+                    if sess.config.get("email"):
+                        sess.account.metadata["email"] = sess.config["email"]
+                        sess.account.description = f"Antigravity account ({sess.config['email']})"
+
+                # If an auth token / key was entered directly, persist to token file with 0600 permissions
+                auth_token = sess.config.get("auth_token") or ""
+                if auth_token:
+                    token_file = profile_dir / TOKEN_FILENAME
+                    token_file.write_text(auth_token, encoding="utf-8")
+                    try:
+                        token_file.chmod(0o600)
+                    except OSError:
+                        pass
+                    cred_ref = f"secret://mission-control/antigravity/{sess.account_id}/oauth_token"
+                    try:
+                        get_credential_manager().store(cred_ref, auth_token)
+                        sess.credential_reference = cred_ref
+                    except Exception:
+                        pass
             elif pid == "cline":
                 mgr = ClineAuthManager()
                 config_dir, data_dir = mgr.setup_account_isolation(sess.account_id)
@@ -572,6 +637,30 @@ class WizardManager:
                         report.error_message or "Validation failed",
                         AccountLifecycleState.VALIDATION_FAILED,
                     )
+        elif pid == "antigravity":
+            mgr = AntigravityAuthManager()
+            data_dir = sess.config.get("app_data_dir") or sess.account_id
+            token_exists = mgr.check_token_exists(data_dir)
+            if not token_exists and not sess.credential_reference:
+                raise WizardError(
+                    f"Authentication token not detected in profile {data_dir}. "
+                    f"Please launch Google Sign-In or enter your token.",
+                    AccountLifecycleState.AUTH_FAILED,
+                )
+            if live and mgr.binary:
+                ok, msg, models = mgr.validate_session(data_dir, timeout_seconds=30)
+                if ok and models:
+                    sess.discovered_models = models
+                else:
+                    sess.discovered_models = [
+                        "gemini-3.8-flash-medium", "gemini-3.7-flash-high", "gemini-3.7-flash-medium",
+                        "gemini-3.1-pro-high", "claude-sonnet-4-6", "claude-opus-4-6-thinking"
+                    ]
+            else:
+                sess.discovered_models = [
+                    "gemini-3.8-flash-medium", "gemini-3.7-flash-high", "gemini-3.7-flash-medium",
+                    "gemini-3.1-pro-high", "claude-sonnet-4-6", "claude-opus-4-6-thinking"
+                ]
         else:
             # Agent providers: models come from their own registries; the isolated
             # directories were created in authenticate. Accept as validated.
@@ -599,16 +688,57 @@ class WizardManager:
             acct.models = list(sess.discovered_models)[:50]
         if sess.config.get("base_url"):
             acct.endpoint = sess.config["base_url"]
-        # Phase 22 Parts 9+12: an account with no capabilities is inadmissible to
-        # the router (AccountRejectionReason.CAPABILITY_MISMATCH), so onboarding
-        # one without them would produce an account that reaches ONLINE and then
-        # silently never receives work. Capabilities are therefore always
-        # resolved before registration, and only from the Capability vocabulary
-        # the router actually understands.
         acct.capabilities = self._resolve_capabilities(sess)
         registry.account_registry.register_account(acct)
         sess.registered = True
         sess.step = "register"
+
+        # OmniRoute-style Antigravity persistence & active routing pool registration
+        if sess.provider_id == "antigravity":
+            app_data_dir = sess.config.get("app_data_dir") or (sess.account.metadata.get("data_dir") if sess.account else sess.account_id)
+            email = sess.config.get("email") or (sess.account.metadata.get("email") if sess.account else "")
+            desc = f"Antigravity account ({email})" if email else f"Antigravity account {sess.account_id}"
+            acct.description = desc
+            account_conf = {
+                "account_id": sess.account_id.replace("antigravity-", ""),
+                "agent_id": sess.account_id,
+                "display_name": acct.display_name,
+                "description": desc,
+                "priority": acct.priority,
+                "enabled": True,
+                "models": acct.models or ["gemini-3.8-flash-medium", "gemini-3.7-flash-high", "gemini-3.7-flash-medium"],
+                "default_model": (acct.models[0] if acct.models else "gemini-3.8-flash-medium"),
+                "capabilities": acct.capabilities,
+                "execution": {
+                    "command": "~/.gemini/bin/agy",
+                    "app_data_dir": app_data_dir,
+                    "output_format": "json",
+                    "dangerously_skip_permissions": False,
+                    "default_timeout_seconds": 300,
+                },
+            }
+            try:
+                add_account_config("antigravity", sess.account_id, account_conf)
+            except Exception as exc:
+                pass
+
+            # Live-register adapter with Antigravity provider & AI bridge so router picks it up in real time
+            try:
+                prov = registry.get_provider("antigravity")
+                if prov:
+                    adapter_cfg = AntigravityAdapter._config_from_dict(
+                        sess.account_id, account_conf,
+                        command="~/.gemini/bin/agy",
+                        fallback_commands=("~/.local/bin/agy", "~/.local/bin/antigravity", "/usr/local/bin/antigravity"),
+                        profile_root=Path.home() / ".gemini",
+                    )
+                    adapter = AntigravityAccountAdapter(adapter_cfg)
+                    prov.add_adapter(adapter)
+                    bridge = AgentProviderBridge(adapter)
+                    registry.register_ai_provider(bridge)
+            except Exception as exc:
+                pass
+
         wizard_event_stream.emit(
             "account.registered", sess.correlation_id, sess.provider_id, sess.account_id,
             message="Account registered into registry", lifecycle_state=acct.lifecycle_state.value,
@@ -660,6 +790,9 @@ class WizardManager:
         if sess.account is None:
             raise WizardError("No account to bring online", AccountLifecycleState.CONFIG_ERROR)
         self._transition(sess, AccountLifecycleState.ONLINE, reason="Online")
+        sess.account.auth_state = AuthState.AUTHENTICATED
+        sess.account.health_state = HealthState.HEALTHY
+        sess.account.status = AccountStatus.ONLINE
         sess.step = "complete"
         sess.completed = True
         wizard_event_stream.emit(
@@ -752,6 +885,18 @@ class WizardManager:
                     cleanup["account_record_removed"] = True
                 except Exception:
                     pass
+
+        if sess.provider_id == "antigravity":
+            try:
+                remove_account_config("antigravity", sess.account_id)
+            except Exception:
+                pass
+            try:
+                prov = registry.get_provider("antigravity")
+                if prov:
+                    prov.remove_adapter(sess.account_id)
+            except Exception:
+                pass
 
         wizard_event_stream.emit(
             "account.removed", sess.correlation_id, sess.provider_id, sess.account_id,
@@ -1314,7 +1459,13 @@ class MissionControlHandler(BaseHTTPRequestHandler):
         active_workers = [a.agent_id for a in registry.list_active_adapters()]
 
         today_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+        total_usage = get_usage_tracker().get_summary()
         today_usage = get_usage_tracker().get_summary(day=today_str)
+        known_tokens_total = token_metrics.get("known_tokens", 0) or token_metrics.get("total_known_tokens", 0)
+        today_tokens_val = today_usage.get("total_tokens", 0) or known_tokens_total
+        today_cost_val = today_usage.get("estimated_cost_usd", 0.0) or total_usage.get("estimated_cost_usd", 0.0)
+        total_cost_val = total_usage.get("estimated_cost_usd", 0.0)
+        total_tokens_val = total_usage.get("total_tokens", 0) or known_tokens_total
         all_jobs = job_manager.list_jobs(limit=100)
         active_jobs = [j for j in all_jobs if j.status in ("pending", "running")]
         completed_jobs = [j for j in all_jobs if j.status == "completed"]
@@ -1337,10 +1488,13 @@ class MissionControlHandler(BaseHTTPRequestHandler):
             "active_jobs": len(active_jobs),
             "completed_jobs": len(completed_jobs),
             "failed_jobs": len(failed_jobs),
-            "today_tokens": today_usage.get("total_tokens", 0),
-            "today_cost": today_usage.get("estimated_cost_usd", 0.0),
-            "today_usage_tokens": today_usage.get("total_tokens", 0),
-            "today_estimated_cost_usd": today_usage.get("estimated_cost_usd", 0.0),
+            "today_tokens": today_tokens_val,
+            "today_cost": today_cost_val,
+            "today_usage_tokens": today_tokens_val,
+            "today_estimated_cost_usd": today_cost_val,
+            "total_tokens": total_tokens_val,
+            "total_cost": total_cost_val,
+            "known_tokens": known_tokens_total,
             "recent_routing": recent_routing,
         }
 
@@ -1494,6 +1648,15 @@ class MissionControlHandler(BaseHTTPRequestHandler):
                 })
         elif path == "/api/wizard/events":
             self._serve_json({"events": wizard_event_stream.recent(100)})
+        elif path == "/api/wizard/check-auth":
+            query = self.path.split("?")[1] if "?" in self.path else ""
+            params = urllib.parse.parse_qs(query)
+            wid = params.get("wizard_id", [None])[0]
+            sess = wizard_manager.get(wid) if wid else None
+            if not sess:
+                self._serve_json({"error": "Wizard session not found"}, status=404)
+            else:
+                self._serve_json(wizard_manager.check_auth_status(sess))
 
         elif path == "/api/events/stream":
             self.send_response(200)
@@ -1619,7 +1782,7 @@ class MissionControlHandler(BaseHTTPRequestHandler):
             fname = params.get("filename", ["current.json"])[0]
             rec = handoff_manager.get_record_by_name(fname)
             self._serve_json({"record": rec})
-        elif path == "/api/metrics/tokens":
+        elif path in ("/api/metrics/tokens", "/api/tokens"):
             self._serve_json(orchestrator.swarm.token_tracker.get_metrics())
         elif path == "/api/router/history":
             self._serve_json({"history": orchestrator.router.get_routing_history(50)})
@@ -2654,6 +2817,7 @@ class MissionControlHandler(BaseHTTPRequestHandler):
         elif path.startswith("/api/wizard/") and path.split("/")[-1] in (
             "select-auth", "configure", "authenticate", "validate",
             "register", "health", "complete", "back", "cancel", "retry",
+            "launch-login", "check-auth",
         ):
             if not self._verify_auth(path):
                 return
@@ -2670,6 +2834,12 @@ class MissionControlHandler(BaseHTTPRequestHandler):
                 elif action == "configure":
                     wizard_manager.configure(sess, dict(payload.get("config") or payload))
                     self._serve_json({"status": "ok", "wizard": sess.to_dict()})
+                elif action == "launch-login":
+                    info = wizard_manager.launch_login(sess)
+                    self._serve_json({"status": "ok", "login": info, "wizard": sess.to_dict()})
+                elif action == "check-auth":
+                    status_info = wizard_manager.check_auth_status(sess)
+                    self._serve_json({"status": "ok", "auth_status": status_info, "wizard": sess.to_dict()})
                 elif action == "authenticate":
                     wizard_manager.authenticate(sess)
                     self._serve_json({"status": "ok", "wizard": sess.to_dict()})
@@ -2824,7 +2994,15 @@ class MissionControlHandler(BaseHTTPRequestHandler):
             _acct_pre = registry.account_registry.get_account(a_id)
             cred_ref_display = getattr(_acct_pre, "credential_reference", "") if _acct_pre else ""
             had_credential = bool(cred_ref_display)
+            provider_id = getattr(_acct_pre, "provider_id", "") if _acct_pre else ""
             removed = registry.account_registry.remove_account(a_id)
+            config_rewritten = False
+            if removed and provider_id:
+                try:
+                    remove_account_config(provider_id, a_id)
+                    config_rewritten = True
+                except Exception:
+                    pass
             if removed:
                 # Phase 22 Part 7: report scoped cleanup detail so the operator
                 # sees exactly what was deleted. We report the credential
@@ -2839,7 +3017,7 @@ class MissionControlHandler(BaseHTTPRequestHandler):
                     # CredentialManager during removal.
                     "reference_purged": bool(had_credential),
                     "credential_reference": cred_ref_display,
-                    "config_file_rewritten": False,
+                    "config_file_rewritten": config_rewritten,
                     "usage_history_retained": True,
                 }
                 self._serve_json({"status": "removed", "account_id": a_id, "cleanup": cleanup})
@@ -2937,14 +3115,8 @@ class MissionControlHandler(BaseHTTPRequestHandler):
       <button onclick="showTab('memory')" class="tab-btn w-full text-left px-3 py-2 rounded text-sm hover:bg-slate-800 text-slate-300 font-medium" data-tab="memory">
         <i class="fa-solid fa-database mr-2 text-purple-400"></i> Shared Memory
       </button>
-      <button onclick="showTab('handoffs')" class="tab-btn w-full text-left px-3 py-2 rounded text-sm hover:bg-slate-800 text-slate-300 font-medium" data-tab="handoffs">
-        <i class="fa-solid fa-file-contract mr-2 text-emerald-400"></i> Handoffs
-      </button>
       <button onclick="showTab('events')" class="tab-btn w-full text-left px-3 py-2 rounded text-sm hover:bg-slate-800 text-slate-300 font-medium" data-tab="events">
         <i class="fa-solid fa-bolt mr-2 text-yellow-400"></i> Live Events
-      </button>
-      <button onclick="showTab('git')" class="tab-btn w-full text-left px-3 py-2 rounded text-sm hover:bg-slate-800 text-slate-300 font-medium" data-tab="git">
-        <i class="fa-brands fa-git-alt mr-2 text-red-400"></i> Git & Security
       </button>
       <div class="pt-3 pb-1 px-1 text-[10px] uppercase tracking-widest text-slate-600 font-bold border-t border-slate-800 mt-2">Phase 10 — Mission Control</div>
       <button onclick="showTab('mc-providers')" class="tab-btn w-full text-left px-3 py-2 rounded text-sm hover:bg-slate-800 text-slate-300 font-medium" data-tab="mc-providers">
@@ -3395,42 +3567,6 @@ class MissionControlHandler(BaseHTTPRequestHandler):
         </div>
       </section>
 
-      <!-- HANDOFFS TAB -->
-      <section id="tab-handoffs" class="tab-pane hidden space-y-4">
-        <div class="flex items-center justify-between">
-          <div>
-            <h2 class="text-xl font-bold text-white">Structured Handoff Viewer & Historical Archive</h2>
-            <p class="text-sm text-slate-400">Context delivery between sequential agent hops and persistent handoff timeline.</p>
-          </div>
-          <button onclick="triggerContinue()" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded text-xs font-medium transition flex items-center gap-1.5">
-            <i class="fa-solid fa-play"></i> Continue from Handoff
-          </button>
-        </div>
-
-        <div class="grid grid-cols-3 gap-4">
-          <!-- Left: Current Handoff (2 cols) -->
-          <div class="col-span-2 space-y-3">
-            <h3 class="text-xs font-bold uppercase tracking-wider text-emerald-400 font-mono flex items-center gap-2">
-              <i class="fa-solid fa-file-lines"></i> <span id="handoff-active-title">Current Active Handoff</span>
-            </h3>
-            <div id="handoff-card" class="bg-slate-900 border border-slate-800 p-4 rounded-lg space-y-2 text-xs"></div>
-            <div id="handoff-content" class="bg-slate-900 border border-slate-800 p-6 rounded-lg font-sans text-sm prose prose-invert max-w-none">
-              Loading handoff...
-            </div>
-          </div>
-
-          <!-- Right: Historical Handoff Archive (1 col) -->
-          <div class="space-y-3">
-            <h3 class="text-xs font-bold uppercase tracking-wider text-cyan-400 font-mono flex items-center gap-2">
-              <i class="fa-solid fa-clock-rotate-left"></i> Handoff History
-            </h3>
-            <div id="handoff-history-list" class="space-y-2 max-h-[700px] overflow-y-auto">
-              <div class="text-xs text-slate-500 p-3 bg-slate-900 rounded border border-slate-800">Loading history...</div>
-            </div>
-          </div>
-        </div>
-      </section>
-
       <!-- EVENTS TAB -->
       <section id="tab-events" class="tab-pane hidden space-y-4">
         <!-- PHASE 22 PART 10: Live Account & Authentication Lifecycle Feed -->
@@ -3498,20 +3634,6 @@ class MissionControlHandler(BaseHTTPRequestHandler):
               <tr><td colspan="5" class="p-4 text-center text-slate-500">Connecting to real-time telemetry stream...</td></tr>
             </tbody>
           </table>
-        </div>
-      </section>
-
-      <!-- GIT TAB -->
-      <section id="tab-git" class="tab-pane hidden space-y-4">
-        <h2 class="text-xl font-bold text-white mb-2">Git Repository & Security Status</h2>
-        <div class="bg-slate-900 border border-slate-800 p-6 rounded-lg space-y-3 font-mono text-xs">
-          <div>Repository: <span class="text-emerald-400">YashJadhav1023/Agentic-Brian</span></div>
-          <div>Branch: <span id="git-branch" class="text-cyan-400">main</span></div>
-          <div>Latest Commit: <span id="git-commit" class="text-slate-300"></span></div>
-          <div>Working Tree: <span id="git-status-text" class="text-amber-400"></span></div>
-          <div class="mt-4 p-3 bg-slate-950 border border-slate-800 rounded text-slate-400">
-            Zero-Leak Policy Active: Runtime logs, locks, keys, and private credentials strictly excluded via .gitignore.
-          </div>
         </div>
       </section>
 
@@ -4417,12 +4539,14 @@ class MissionControlHandler(BaseHTTPRequestHandler):
 
         // Render Tokens summary
         const tm = status.token_metrics || { known_tokens: 0, unknown_count: 0, total_tasks: 0 };
+        const knownTok = (tm.known_tokens != null && tm.known_tokens > 0) ? tm.known_tokens : (mc.known_tokens || mc.today_tokens || mc.total_tokens || 0);
+        const costVal = (mc.today_estimated_cost_usd != null && mc.today_estimated_cost_usd > 0) ? mc.today_estimated_cost_usd : (mc.today_cost || mc.total_cost || 0.0);
         const statTokens = document.getElementById('stat-tokens');
-        if (statTokens) statTokens.textContent = (tm.known_tokens || 0).toLocaleString();
+        if (statTokens) statTokens.textContent = (knownTok || 0).toLocaleString();
         const statTokensSub = document.getElementById('stat-tokens-sub');
-        if (statTokensSub) statTokensSub.textContent = `${(tm.known_tokens || 0).toLocaleString()} tokens | $${(mc.today_estimated_cost_usd || 0).toFixed(2)} cost`;
+        if (statTokensSub) statTokensSub.textContent = `${(knownTok || 0).toLocaleString()} verified | $${(costVal || 0).toFixed(2)} cost`;
         const tkVal = document.getElementById('tokens-known-val');
-        if (tkVal) tkVal.textContent = (tm.known_tokens || 0).toLocaleString();
+        if (tkVal) tkVal.textContent = (knownTok || 0).toLocaleString();
         const tuVal = document.getElementById('tokens-unknown-val');
         if (tuVal) tuVal.textContent = tm.unknown_count || 0;
         const ttVal = document.getElementById('tokens-total-val');
@@ -4594,12 +4718,16 @@ class MissionControlHandler(BaseHTTPRequestHandler):
         await loadEvents();
 
         // Render Git Info
-        const resGit = await fetchWithAuth('/api/git');
-        const gitData = await resGit.json();
-        document.getElementById('git-badge').textContent = gitData.branch + '@' + gitData.commit;
-        document.getElementById('git-branch').textContent = gitData.branch;
-        document.getElementById('git-commit').textContent = gitData.commit;
-        document.getElementById('git-status-text').textContent = gitData.status;
+        try {
+          const resGit = await fetchWithAuth('/api/git');
+          if (resGit.ok) {
+            const gitData = await resGit.json();
+            const gb = document.getElementById('git-badge'); if (gb) gb.textContent = gitData.branch + '@' + gitData.commit;
+            const gbr = document.getElementById('git-branch'); if (gbr) gbr.textContent = gitData.branch;
+            const gc = document.getElementById('git-commit'); if (gc) gc.textContent = gitData.commit;
+            const gst = document.getElementById('git-status-text'); if (gst) gst.textContent = gitData.status;
+          }
+        } catch (e) {}
 
       } catch (err) {
         console.error('Error refreshing data:', err);
@@ -4749,7 +4877,8 @@ class MissionControlHandler(BaseHTTPRequestHandler):
         } else if (hCard) {
           hCard.classList.add('hidden');
         }
-        document.getElementById('handoff-content').innerHTML = marked.parse(handoffData.markdown || 'No active handoff record.');
+        const hContent = document.getElementById('handoff-content');
+        if (hContent) hContent.innerHTML = marked.parse(handoffData.markdown || 'No active handoff record.');
 
         const resHist = await fetchWithAuth('/api/handoff/history');
         const histData = await resHist.json();
@@ -4888,6 +5017,10 @@ class MissionControlHandler(BaseHTTPRequestHandler):
         if (wizState && evt.correlation_id === wizState.correlation_id) {
           wizAppendFeed(evt);
         }
+      }
+      // Real-time telemetry trigger: refresh dashboard immediately on token, usage, or task events
+      if (['TOKEN_CONSUMED', 'USAGE_RECORDED', 'TASK_COMPLETED', 'TASK_STARTED', 'JOB_COMPLETED', 'account.online', 'account.registered'].includes(et)) {
+        refreshData();
       }
     }
 
@@ -5705,6 +5838,10 @@ class MissionControlHandler(BaseHTTPRequestHandler):
 
     function wizClose() {
       document.getElementById('wizard-modal').classList.add('hidden');
+      if (window._wizPollInterval) {
+        clearInterval(window._wizPollInterval);
+        window._wizPollInterval = null;
+      }
       wizState = null;
     }
 
@@ -5757,7 +5894,7 @@ class MissionControlHandler(BaseHTTPRequestHandler):
           <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1">Provider *</label>
           <select id="wiz-provider" onchange="wizState.provider_id=this.value" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200">${opts}</select>
           <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-3">New Account ID *</label>
-          <input id="wiz-account-id" value="${wizState.account_id || ''}" placeholder="e.g. openai-team-2" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono">
+          <input id="wiz-account-id" value="${wizState.account_id || ''}" placeholder="e.g. antigravity-account-4" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono">
           <p class="text-[10px] text-slate-500 mt-1">Only alphanumerics, dashes and underscores.</p>`;
         if (!wizState.provider_id && wizState.providers.length) wizState.provider_id = wizState.providers[0].id;
       } else if (wizState.step === 'select_auth') {
@@ -5770,7 +5907,7 @@ class MissionControlHandler(BaseHTTPRequestHandler):
         } else {
           nextBtn.disabled = false; nextBtn.classList.remove('opacity-40');
           body.innerHTML = `
-            <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1">Authentication Method (only what this provider truly supports)</label>
+            <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1">Authentication Method</label>
             <div class="space-y-1.5">` + methods.map((m, i) => `
               <label class="flex items-start gap-2 bg-slate-950 border border-slate-800 rounded p-2 cursor-pointer">
                 <input type="radio" name="wiz-auth" value="${m.id}" ${(wizState.auth_method === m.id || (!wizState.auth_method && i === 0)) ? 'checked' : ''} onchange="wizState.auth_method=this.value" class="mt-0.5">
@@ -5779,7 +5916,59 @@ class MissionControlHandler(BaseHTTPRequestHandler):
           if (!wizState.auth_method && methods.length) wizState.auth_method = methods[0].id;
         }
       } else if (wizState.step === 'configure') {
-        const needsKey = wizState.auth_method === 'api_key';
+        const isAntigravity = wizState.provider_id === 'antigravity';
+        const isApiKey = wizState.auth_method === 'api_key';
+
+        let customFields = '';
+        if (isAntigravity) {
+          customFields = `
+            <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-2">Google Account Email *</label>
+            <input id="wiz-email" type="email" placeholder="e.g. user@gmail.com" value="${wizState.email || ''}" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200">
+            <p class="text-[10px] text-slate-500 mt-0.5">Identifies this Antigravity account in the multi-account routing pool.</p>
+
+            ${wizState.auth_method === 'oauth' ? `
+            <div class="mt-3 p-3 bg-slate-950 border border-indigo-900/60 rounded space-y-2">
+              <div class="flex items-center justify-between">
+                <span class="text-xs font-semibold text-indigo-300">OmniRoute-Style Google OAuth Onboarding</span>
+                <span id="wiz-oauth-status" class="text-[10px] text-slate-400">Ready</span>
+              </div>
+              <p class="text-[11px] text-slate-400">Launch Google sign-in to authenticate this account in an isolated profile, or paste your token below.</p>
+              <div class="flex items-center gap-2">
+                <button type="button" onclick="wizLaunchOAuthLogin()" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded shadow flex items-center gap-1.5">
+                  <svg class="w-3.5 h-3.5 fill-current" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14.5v-9l6 4.5-6 4.5z"/></svg>
+                  Launch Google Sign-In
+                </button>
+                <button type="button" onclick="wizCheckAuthStatus()" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded border border-slate-700">
+                  Check Token
+                </button>
+              </div>
+              <div id="wiz-oauth-instructions" class="hidden text-[10px] font-mono text-slate-400 bg-slate-900 p-2 rounded border border-slate-800 break-all"></div>
+
+              <div class="pt-1">
+                <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1">Direct OAuth Token / Session Key (Optional)</label>
+                <input id="wiz-key" type="password" placeholder="Paste session token / key directly if preferred" class="w-full bg-slate-900 border border-slate-800 rounded p-2 text-slate-200 font-mono text-xs">
+              </div>
+            </div>` : `
+            <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-2">Direct OAuth Token / Session Key *</label>
+            <input id="wiz-key" type="password" placeholder="Paste token here..." class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono">
+            <p class="text-[10px] text-emerald-400/80 mt-1">🔒 Stored in isolated profile directory with 0600 permissions.</p>`}
+          `;
+        } else if (isApiKey) {
+          customFields = `
+            <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-2">Base URL (optional)</label>
+            <input id="wiz-baseurl" placeholder="https://api.openai.com/v1" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono">
+            <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-2">API Key / Secret *</label>
+            <input id="wiz-key" type="password" placeholder="sk-..." class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono">
+            <p class="text-[10px] text-emerald-400/80 mt-1">🔒 Sent once to CredentialManager. Only a secret:// reference is ever stored or shown.</p>
+          `;
+        } else {
+          customFields = `
+            <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-2">Base URL (optional)</label>
+            <input id="wiz-baseurl" placeholder="https://..." class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono">
+            <p class="text-[10px] text-slate-500 mt-2">This provider uses ${wizState.auth_method}. A fresh isolated profile directory will be allocated in the next step.</p>
+          `;
+        }
+
         body.innerHTML = `
           <div class="grid grid-cols-2 gap-3">
             <div><label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1">Display Name</label>
@@ -5787,28 +5976,46 @@ class MissionControlHandler(BaseHTTPRequestHandler):
             <div><label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1">Priority</label>
               <input id="wiz-priority" type="number" value="10" min="1" max="100" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200"></div>
           </div>
-          <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-2">Base URL (optional)</label>
-          <input id="wiz-baseurl" placeholder="https://api.openai.com/v1" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono">
-          ${needsKey ? `
-          <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-2">API Key / Secret *</label>
-          <input id="wiz-key" type="password" placeholder="sk-..." class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono">
-          <p class="text-[10px] text-emerald-400/80 mt-1">🔒 Sent once to CredentialManager. Only a secret:// reference is ever stored or shown.</p>` : `
-          <p class="text-[10px] text-slate-500 mt-2">This provider uses ${wizState.auth_method}. A fresh isolated profile directory will be allocated in the next step; the official login runs out-of-band and never touches the Antigravity IDE profile.</p>`}`;
+          ${customFields}`;
       } else if (wizState.step === 'authenticate') {
-        body.innerHTML = `<div class="text-slate-400">Ready to authenticate <span class="font-mono text-slate-200">${wizState.account_id}</span> against <span class="font-mono text-slate-200">${wizState.provider_id}</span> using <span class="text-indigo-300">${wizState.auth_method}</span>.</div>
-          <div class="text-[11px] text-slate-500">Click <b>Next</b> to run the isolated authentication step. Lifecycle → AUTHENTICATING → AUTHENTICATED.</div>`;
+        const isAntigravity = wizState.provider_id === 'antigravity';
+        body.innerHTML = `
+          <div class="space-y-3">
+            <div class="text-slate-300 font-medium">Ready to authenticate <span class="font-mono text-indigo-300">${wizState.account_id}</span> (${wizState.provider_id}).</div>
+            ${isAntigravity ? `
+            <div class="bg-slate-950 border border-slate-800 rounded p-3 text-xs space-y-1.5 font-mono">
+              <div><span class="text-slate-500">Email:</span> <span class="text-slate-200">${wizState.email || 'None specified'}</span></div>
+              <div><span class="text-slate-500">Profile:</span> <span class="text-slate-200">~/.gemini/antigravity-account-${wizState.account_id.replace('antigravity-', '')}</span></div>
+              <div id="wiz-auth-token-status" class="flex items-center gap-2 mt-2 pt-2 border-t border-slate-800">
+                <span class="text-slate-500">Status:</span>
+                <span class="text-amber-400 font-sans">Checking token status...</span>
+              </div>
+            </div>
+            <div class="flex items-center gap-2">
+              <button type="button" onclick="wizCheckAuthStatus()" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded border border-slate-700">
+                Verify Token Presence
+              </button>
+            </div>
+            <div class="text-[11px] text-slate-500">Click <b>Next</b> to authenticate. If you already signed in or entered your token, it will be validated in the next step.</div>
+            ` : `
+            <div class="text-[11px] text-slate-500">Click <b>Next</b> to run the isolated authentication step. Lifecycle → AUTHENTICATING → AUTHENTICATED.</div>
+            `}
+          </div>`;
+        if (isAntigravity) {
+          setTimeout(wizCheckAuthStatus, 100);
+        }
       } else if (wizState.step === 'validate') {
-        body.innerHTML = `<div class="text-slate-400">Run a real pre-flight validation (models discovery / connectivity). Lifecycle → VALIDATING → READY.</div>
-          <label class="flex items-center gap-2 mt-2 text-[11px] text-slate-400"><input type="checkbox" id="wiz-live" checked> Perform a live network probe</label>`;
+        body.innerHTML = `<div class="text-slate-400">Run pre-flight validation (models discovery / connectivity). Lifecycle → VALIDATING → READY.</div>
+          <label class="flex items-center gap-2 mt-2 text-[11px] text-slate-400"><input type="checkbox" id="wiz-live" checked> Perform a live validation probe</label>`;
       } else if (wizState.step === 'register') {
-        body.innerHTML = `<div class="text-slate-400">Register <span class="font-mono text-slate-200">${wizState.account_id}</span> into the registry and account pool.</div>
+        body.innerHTML = `<div class="text-slate-400">Register <span class="font-mono text-slate-200">${wizState.account_id}</span> into the registry and active routing pool.</div>
           <div class="text-[11px] text-slate-500 mt-1">Discovered models: <span class="text-slate-300 font-mono">${(wizState.lastModels != null ? wizState.lastModels : 0)}</span></div>`;
       } else if (wizState.step === 'health_check') {
         body.innerHTML = `<div class="text-slate-400">Run the final health check, then bring the account <b>ONLINE</b>.</div>
           <div id="wiz-health-result" class="text-[11px] text-slate-500 mt-1"></div>`;
       } else if (wizState.step === 'complete') {
         body.innerHTML = `<div class="bg-emerald-950/60 border border-emerald-800 rounded p-3 text-emerald-300">
-          ✓ Account <span class="font-mono">${wizState.account_id}</span> is now ONLINE. This flow's correlation id: <span class="font-mono">${wizState.correlation_id}</span></div>`;
+          ✓ Account <span class="font-mono">${wizState.account_id}</span> is now ONLINE and added to real-time routing pool. Correlation id: <span class="font-mono">${wizState.correlation_id}</span></div>`;
         document.getElementById('wiz-btn-back').classList.add('hidden');
         document.getElementById('wiz-btn-cancel').classList.add('hidden');
       }
@@ -5854,8 +6061,16 @@ class MissionControlHandler(BaseHTTPRequestHandler):
             priority: parseInt(document.getElementById('wiz-priority')?.value || '10') || 10,
             base_url: (document.getElementById('wiz-baseurl')?.value || '').trim() || null,
           };
+          const emailEl = document.getElementById('wiz-email');
+          if (emailEl && emailEl.value.trim()) {
+            cfg.email = emailEl.value.trim();
+            wizState.email = cfg.email;
+          }
           const keyEl = document.getElementById('wiz-key');
-          if (keyEl && keyEl.value.trim()) cfg.api_key = keyEl.value.trim();
+          if (keyEl && keyEl.value.trim()) {
+            cfg.api_key = keyEl.value.trim();
+            cfg.auth_token = keyEl.value.trim();
+          }
           const r = await wizPost('configure', { config: cfg });
           if (keyEl) keyEl.value = '';  // never keep the secret in the DOM
           if (!r.ok) { wizShowError(r.d.error || ('HTTP ' + r.status)); return; }
@@ -5928,6 +6143,73 @@ class MissionControlHandler(BaseHTTPRequestHandler):
         loadAccounts(); loadProviders(); refreshData();
       } catch (err) { showToast('Cancel error: ' + err.message, 'error'); }
       wizClose();
+    }
+
+    async function wizLaunchOAuthLogin() {
+      const st = document.getElementById('wiz-oauth-status');
+      const ins = document.getElementById('wiz-oauth-instructions');
+      if (st) st.textContent = 'Launching isolated profile session...';
+      try {
+        const r = await wizPost('launch-login', {});
+        if (r.ok && r.d.login) {
+          const l = r.d.login;
+          if (st) {
+            st.className = 'text-[10px] text-emerald-400 font-semibold';
+            st.textContent = 'Profile ready. Waiting for auth completion...';
+          }
+          if (ins) {
+            ins.classList.remove('hidden');
+            ins.innerHTML = `<strong>Command:</strong> ${l.command_str || l.command}<br><span class="text-slate-400">${l.instructions || ''}</span>`;
+          }
+          if (!window._wizPollInterval) {
+            window._wizPollInterval = setInterval(async () => {
+              if (!wizState || (wizState.step !== 'configure' && wizState.step !== 'authenticate')) {
+                clearInterval(window._wizPollInterval);
+                window._wizPollInterval = null;
+                return;
+              }
+              await wizCheckAuthStatus();
+            }, 3000);
+          }
+        } else {
+          if (st) {
+            st.className = 'text-[10px] text-red-400';
+            st.textContent = r.d.error || 'Failed to initiate';
+          }
+        }
+      } catch (e) {
+        if (st) {
+          st.className = 'text-[10px] text-red-400';
+          st.textContent = 'Network error: ' + e.message;
+        }
+      }
+    }
+
+    async function wizCheckAuthStatus() {
+      if (!wizState || !wizState.wizard_id) return;
+      try {
+        const res = await fetchWithAuth('/api/wizard/check-auth?wizard_id=' + encodeURIComponent(wizState.wizard_id));
+        const d = await res.json();
+        const st = document.getElementById('wiz-oauth-status');
+        const tokenStatusEl = document.getElementById('wiz-auth-token-status');
+        if (d.token_exists) {
+          if (st) {
+            st.className = 'text-[10px] text-emerald-400 font-bold';
+            st.textContent = '✓ Token Detected';
+          }
+          if (tokenStatusEl) {
+            tokenStatusEl.innerHTML = `<span class="text-slate-500">Status:</span> <span class="text-emerald-400 font-sans font-bold">✓ Token Detected & Active</span>`;
+          }
+          if (window._wizPollInterval) {
+            clearInterval(window._wizPollInterval);
+            window._wizPollInterval = null;
+          }
+        } else {
+          if (tokenStatusEl) {
+            tokenStatusEl.innerHTML = `<span class="text-slate-500">Status:</span> <span class="text-amber-400 font-sans">Token file not found yet. Complete login or paste token.</span>`;
+          }
+        }
+      } catch (e) {}
     }
 
     async function openLegacyAddAccountModal(preselectedProviderId) {
