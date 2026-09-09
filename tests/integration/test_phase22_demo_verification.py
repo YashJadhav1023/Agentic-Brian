@@ -83,6 +83,11 @@ class _WizardDemoTestCase(unittest.TestCase):
                     cm.delete(ref)
             except Exception:
                 pass
+        from providers.registry.config import remove_account_config
+        try:
+            remove_account_config(self.provider_id, self.account_id)
+        except Exception:
+            pass
 
     # ---- HTTP helpers ----------------------------------------------------
 

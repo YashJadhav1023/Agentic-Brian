@@ -16,7 +16,10 @@ import datetime
 import errno
 import hmac
 import json
+import logging
 import os
+
+logger = logging.getLogger("MissionControl.Dashboard")
 import queue
 import re
 import secrets
@@ -63,7 +66,8 @@ from providers.api.ollama_local import OllamaProvider
 from providers.api.openai_compatible import OpenAICompatibleProvider
 from providers.base import ProviderType
 from providers.registry.account_registry import Account, AccountStatus, AuthenticationType
-from providers.registry.bootstrap import create_default_registry
+from providers.registry.bootstrap import create_default_registry, sync_registry_with_config
+from providers.registry.config import resolve_config_path
 from providers.registry.credential_manager import SecretRedactor, get_credential_manager
 from providers.registry.model_registry import ModelMetadata
 from tasks.manager import Task, TaskManager, TaskPriority, TaskStatus
@@ -71,8 +75,52 @@ from tasks.manager import Task, TaskManager, TaskPriority, TaskStatus
 STATIC_DIR = (Path(__file__).resolve().parent / "static").resolve()
 PORT = int(os.environ.get("BRAIN_PORT", "3333"))
 
+
+def sanitize_account_id(account_id: str) -> str:
+    """Sanitize account ID into a lowercase URL-safe slug."""
+    cleaned = re.sub(r"[^a-zA-Z0-9_\-]+", "-", (account_id or "").strip()).strip("-").lower()
+    return re.sub(r"-+", "-", cleaned)
+
+
 # Core singletons
 registry = create_default_registry()
+
+_last_config_mtime: float = 0.0
+
+
+def ensure_registry_synced(force: bool = False) -> list[str]:
+    """Auto-detect any accounts added or edited in config/providers.json and sync them live without restarts."""
+    global _last_config_mtime
+    cfg_path = resolve_config_path()
+    try:
+        current_mtime = cfg_path.stat().st_mtime
+    except Exception:
+        current_mtime = 0.0
+
+    if force or current_mtime > _last_config_mtime:
+        _last_config_mtime = current_mtime
+        try:
+            synced = sync_registry_with_config(registry, cfg_path)
+            if synced:
+                logger.info(f"[AutoSync] Automatically synced accounts from {cfg_path.name}: {synced}")
+            return synced
+        except Exception as e:
+            logger.error(f"[AutoSync] Error synchronizing config: {e}")
+            return []
+    return []
+
+
+def _config_watcher_loop() -> None:
+    while True:
+        time.sleep(2.5)
+        try:
+            ensure_registry_synced()
+        except Exception:
+            pass
+
+
+threading.Thread(target=_config_watcher_loop, daemon=True, name="mc-config-watcher").start()
+
 task_manager = TaskManager(root_tasks_dir=PROJECT_ROOT / "tasks")
 handoff_manager = HandoffManager(root_dir=PROJECT_ROOT / "handoffs")
 event_bus = EventBus(log_path=PROJECT_ROOT / "runtime" / "logs" / "events.jsonl")
@@ -412,9 +460,13 @@ class WizardManager:
         "groq": [{"id": "api_key", "label": "API Key"}],
         "ollama": [{"id": "api_key", "label": "Endpoint / Local Server"}],
         "kiro": [
-            {"id": "local_session", "label": "Link Active kiro-cli Engine (Local Runtime / Zero-Key)"},
-            {"id": "device_code", "label": "AWS Builder ID / Device Code (Browser Auth)"},
-            {"id": "api_key", "label": "Custom Session Key (Optional Fallback)"},
+            {"id": "local_session", "label": "Link Active kiro-cli Engine (Installed & Active) (Zero-Key)"},
+            {"id": "idc", "label": "AWS IAM Identity Center (Organization SSO)"},
+            {"id": "device_code", "label": "AWS Builder ID / Device Code (Browser Auth - Personal)"},
+            {"id": "google", "label": "Google Account (Social Login)"},
+            {"id": "github", "label": "GitHub Account (Social Login)"},
+            {"id": "import", "label": "Import Token / AWS SSO Cache (Auto-Detect)"},
+            {"id": "api_key", "label": "Custom Session Key / Bearer Token (Manual Fallback)"},
         ],
         "cline": [
             {"id": "local_session", "label": "Link Active Local Cline Session (WorkOS OAuth / Zero-Key)"},
@@ -510,14 +562,34 @@ class WizardManager:
                 "executable": exe,
             })
             methods.append({
+                "id": "idc",
+                "label": "AWS IAM Identity Center (Organization SSO)",
+                "description": "Enterprise login with Start URL (e.g. https://your-org.awsapps.com/start) and AWS region.",
+            })
+            methods.append({
                 "id": "device_code",
-                "label": "AWS Builder ID / Device Code (Browser Auth)",
-                "description": "Authenticate via AWS Builder ID device authorization code.",
+                "label": "AWS Builder ID / Device Code (Browser Auth - Personal)",
+                "description": "Authenticate via personal AWS Builder ID device authorization code.",
+            })
+            methods.append({
+                "id": "google",
+                "label": "Google Account (Social Login)",
+                "description": "Sign in with Google via Kiro Desktop Auth service.",
+            })
+            methods.append({
+                "id": "github",
+                "label": "GitHub Account (Social Login)",
+                "description": "Sign in with GitHub via Kiro Desktop Auth service.",
+            })
+            methods.append({
+                "id": "import",
+                "label": "Import Token / AWS SSO Cache (Auto-Detect)",
+                "description": "Auto-detect cached credentials from ~/.aws/sso/cache or ~/.local/share/kiro-cli or paste refresh token.",
             })
             methods.append({
                 "id": "api_key",
-                "label": "Custom Session Key (Optional Fallback)",
-                "description": "Enter custom AWS session key or bearer token.",
+                "label": "Custom Session Key / Bearer Token (Manual Fallback)",
+                "description": "Enter custom AWS session key, bearer token, or API key.",
             })
             return methods
 
@@ -688,16 +760,30 @@ class WizardManager:
         token_val = api_key or auth_token
         email = (config.get("email") or "").strip() if isinstance(config.get("email"), str) else ""
 
-        # Retain non-secret config only (base_url, model, display_name, priority).
+        # Retain non-secret config only (base_url, model, display_name, priority, etc.).
         safe_config = {
             k: v for k, v in config.items()
-            if k in ("base_url", "model", "models", "display_name", "priority", "app_data_dir", "capabilities", "email")
+            if k in (
+                "base_url", "model", "models", "display_name", "priority",
+                "app_data_dir", "capabilities", "email", "start_url", "region",
+                "refresh_token", "auth_method"
+            )
         }
         if email:
             safe_config["email"] = email
             if sess.account is not None:
                 sess.account.metadata["email"] = email
                 sess.account.description = f"Antigravity account ({email})"
+
+        if sess.provider_id == "kiro" and sess.account is not None:
+            if safe_config.get("start_url"):
+                sess.account.metadata["start_url"] = safe_config["start_url"]
+            if safe_config.get("region"):
+                sess.account.metadata["region"] = safe_config["region"]
+            if safe_config.get("auth_method"):
+                sess.account.metadata["auth_method"] = safe_config["auth_method"]
+            elif sess.auth_method:
+                sess.account.metadata["auth_method"] = sess.auth_method
 
         if token_val:
             safe_config["auth_token"] = token_val
@@ -810,16 +896,58 @@ class WizardManager:
                         sess.account.metadata["auth_method"] = "workos_oauth"
                         sess.account.description = "Cline account (jadhavpc0707@gmail.com - WorkOS OAuth)"
             elif pid == "kiro":
-                # Kiro uses local kiro-cli engine or device code; zero API key needed
                 exe = shutil.which("kiro-cli") or str(Path.home() / ".local" / "bin" / "kiro-cli")
+                auth_method = sess.auth_method or sess.config.get("auth_method") or "local_session"
+                region = sess.config.get("region") or "us-east-1"
+                start_url = sess.config.get("start_url") or ""
+                refresh_token = sess.config.get("refresh_token") or sess.config.get("api_key") or ""
+
                 if sess.account is not None:
                     sess.account.metadata["executable"] = exe
-                    sess.account.description = f"Kiro CLI agent ({exe})"
-                api_key = sess.config.get("api_key") or ""
-                if api_key:
+                    sess.account.metadata["auth_method"] = auth_method
+                    sess.account.metadata["region"] = region
+                    if start_url:
+                        sess.account.metadata["start_url"] = start_url
+
+                    if auth_method == "idc":
+                        sess.account.description = f"Kiro (IAM Identity Center SSO - {region})"
+                    elif auth_method == "google":
+                        sess.account.description = f"Kiro (Google Social Login - {region})"
+                    elif auth_method == "github":
+                        sess.account.description = f"Kiro (GitHub Social Login - {region})"
+                    elif auth_method == "import":
+                        sess.account.description = f"Kiro (AWS SSO Cache Import - {region})"
+                    elif auth_method == "device_code":
+                        sess.account.description = f"Kiro (AWS Builder ID - {region})"
+                    elif auth_method == "api_key":
+                        sess.account.description = f"Kiro (Custom Session Key - {region})"
+                    else:
+                        sess.account.description = f"Kiro CLI agent ({exe})"
+
+                if refresh_token:
                     cred_ref = f"secret://mission-control/kiro/{sess.account_id}/session_key"
-                    get_credential_manager().store(cred_ref, api_key)
+                    get_credential_manager().store(cred_ref, refresh_token)
                     sess.credential_reference = cred_ref
+                elif auth_method in ("import", "idc"):
+                    sso_cache_dir = Path.home() / ".aws" / "sso" / "cache"
+                    if sso_cache_dir.exists():
+                        pref = sso_cache_dir / "kiro-auth-token.json"
+                        c_files = [pref] if pref.exists() else list(sso_cache_dir.glob("*.json"))
+                        for cf in c_files:
+                            try:
+                                d = json.loads(cf.read_text(encoding="utf-8"))
+                                tok = d.get("refreshToken") or d.get("accessToken")
+                                if tok:
+                                    cred_ref = f"secret://mission-control/kiro/{sess.account_id}/session_key"
+                                    get_credential_manager().store(cred_ref, tok)
+                                    sess.credential_reference = cred_ref
+                                    if d.get("region") and sess.account:
+                                        sess.account.metadata["region"] = d["region"]
+                                    if d.get("authMethod") and sess.account:
+                                        sess.account.metadata["auth_method"] = d["authMethod"]
+                                    break
+                            except Exception:
+                                pass
             else:
                 # Direct API providers authenticate implicitly via their key,
                 # which is validated in the next step. Require a stored credential.
@@ -1037,7 +1165,25 @@ class WizardManager:
                 pass
 
         elif sess.provider_id == "kiro":
-            desc = "Kiro CLI agent (Local Engine)"
+            auth_method = (sess.account.metadata.get("auth_method") if sess.account else None) or sess.auth_method or "local_session"
+            region = (sess.account.metadata.get("region") if sess.account else None) or sess.config.get("region") or "us-east-1"
+            start_url = (sess.account.metadata.get("start_url") if sess.account else None) or sess.config.get("start_url") or ""
+
+            if auth_method == "idc":
+                desc = f"Kiro (IAM Identity Center SSO - {region})"
+            elif auth_method == "google":
+                desc = f"Kiro (Google Social Login - {region})"
+            elif auth_method == "github":
+                desc = f"Kiro (GitHub Social Login - {region})"
+            elif auth_method == "import":
+                desc = f"Kiro (AWS SSO Cache Import - {region})"
+            elif auth_method == "device_code":
+                desc = f"Kiro (AWS Builder ID - {region})"
+            elif auth_method == "api_key":
+                desc = f"Kiro (Custom Session Key - {region})"
+            else:
+                desc = "Kiro CLI agent (Local Engine)"
+
             acct.description = desc
             account_conf = {
                 "account_id": sess.account_id.replace("kiro-", ""),
@@ -1046,10 +1192,17 @@ class WizardManager:
                 "description": desc,
                 "priority": acct.priority,
                 "enabled": True,
+                "auth_method": auth_method,
+                "region": region,
                 "capabilities": acct.capabilities,
                 "models": acct.models or ["auto", "claude-opus-5", "claude-sonnet-5", "gpt-5.6-sol"],
                 "default_model": (acct.models[0] if acct.models else "auto"),
             }
+            if start_url:
+                account_conf["start_url"] = start_url
+            if sess.credential_reference:
+                account_conf["credential_reference"] = sess.credential_reference
+
             try:
                 add_account_config("kiro", sess.account_id, account_conf)
             except Exception:
@@ -1452,6 +1605,8 @@ PUBLIC_GET_PATHS = frozenset({
     "/api/health",
     "/api/status",
     "/api/token",
+    "/api/oauth/cline/callback",
+    "/api/oauth/kiro/auto-import",
 })
 
 
@@ -1460,6 +1615,10 @@ def is_public_path(path: str) -> bool:
     if path in PUBLIC_GET_PATHS:
         return True
     if path.startswith("/static/"):
+        return True
+    if path.startswith("/api/oauth/") and (path.endswith("/callback") or path.endswith("/auto-import")):
+        return True
+    if path.startswith("/api/oauth/callback"):
         return True
     return False
 
@@ -1972,6 +2131,9 @@ class MissionControlHandler(BaseHTTPRequestHandler):
         if not self._check_origin():
             return
 
+        # Dynamically sync any changes from config/providers.json
+        ensure_registry_synced()
+
         path = self.path.split("?")[0]
 
         if not is_public_path(path):
@@ -1983,6 +2145,10 @@ class MissionControlHandler(BaseHTTPRequestHandler):
             self._serve_html()
         elif path == "/callback":
             self._handle_oauth_callback()
+        elif path == "/api/oauth/cline/callback":
+            self._handle_cline_oauth_callback()
+        elif path == "/api/oauth/kiro/auto-import":
+            self._handle_kiro_auto_import()
         elif path.startswith("/static/"):
             self._serve_static(path)
         elif path == "/api/overview":
@@ -2951,6 +3117,23 @@ class MissionControlHandler(BaseHTTPRequestHandler):
                 concurrency_limit=int(payload.get("concurrency_limit", 2)),
             )
             registry.account_registry.register_account(new_account)
+            try:
+                acct_data = {
+                    "account_id": name,
+                    "agent_id": account_id,
+                    "display_name": payload.get("display_name", name),
+                    "credential_reference": cred_ref,
+                    "authentication_type": auth_type.value if hasattr(auth_type, "value") else str(auth_type),
+                    "enabled": True,
+                    "priority": int(payload.get("priority", 10)),
+                    "models": models_list,
+                    "capabilities": payload.get("capabilities", []),
+                    "concurrency_limit": int(payload.get("concurrency_limit", 2)),
+                }
+                add_account_config(provider_id, account_id, acct_data)
+                ensure_registry_synced(force=True)
+            except Exception as persist_err:
+                logger.warning(f"Failed to persist account to config/providers.json: {persist_err}")
             self._serve_json({"status": "created", "account": new_account.to_dict()}, status=201)
 
         # ── Phase 12-14: Account Health Check ──────────────────────────
@@ -3669,6 +3852,331 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
   </script>
 </body>
 </html>""")
+
+    def _handle_cline_oauth_callback(self) -> None:
+        """Handle Cline Web OAuth redirect callback (https://api.cline.bot).
+
+        Extracts the authorization code (which contains base64-encoded WorkOS token
+        payloads or code for token exchange), securely sets up isolated credentials
+        under ~/.mission-control/cline/<account_id>, persists to config/providers.json,
+        and dynamically registers the account in the runtime without requiring any
+        code modifications.
+        """
+        query_str = self.path.split("?", 1)[1] if "?" in self.path else ""
+        params = urllib.parse.parse_qs(query_str)
+        error = (params.get("error") or [None])[0]
+        if error:
+            error_desc = (params.get("error_description") or [error])[0]
+            self._serve_html_content(f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Cline Sign-In Failed</title>
+<style>
+body {{ font-family: system-ui, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #0b0f19; color: #f8fafc; }}
+.card {{ text-align: center; padding: 2rem; background: #1e293b; border-radius: 12px; border: 1px solid #ef4444; max-width: 420px; }}
+h1 {{ color: #ef4444; font-size: 1.25rem; }}
+p {{ color: #94a3b8; font-size: 0.875rem; }}
+</style></head>
+<body>
+<div class="card">
+  <h1>Cline Sign-In Failed</h1>
+  <p>{html.escape(error_desc)}</p>
+  <p><button onclick="window.close()" style="padding: 8px 16px; background: #334155; color: white; border: none; border-radius: 6px; cursor: pointer;">Close Window</button></p>
+</div>
+</body></html>""", status=400)
+            return
+
+        code_candidates = params.get("code") or []
+        if not code_candidates:
+            self._serve_html_content("<h1>Missing OAuth 'code' parameter</h1>", status=400)
+            return
+
+        raw_code = code_candidates[0]
+        token_data = None
+        # Cline tokens are embedded as base64-encoded JSON in the code
+        try:
+            base64_str = urllib.parse.unquote(raw_code)
+            padding = 4 - (len(base64_str) % 4)
+            if padding != 4:
+                base64_str += "=" * padding
+            decoded_bytes = base64.b64decode(base64_str, validate=False)
+            decoded_text = decoded_bytes.decode("utf-8", errors="ignore")
+            first_brace = decoded_text.find("{")
+            last_brace = decoded_text.rfind("}")
+            if first_brace != -1 and last_brace != -1:
+                json_str = decoded_text[first_brace:last_brace + 1]
+                token_data = json.loads(json_str)
+        except Exception as e:
+            logger.warning(f"Failed to base64-decode Cline code: {e}")
+
+        # Fallback to direct token exchange if JSON decode was incomplete
+        if not token_data or not (token_data.get("accessToken") or token_data.get("access_token")):
+            try:
+                exchange_url = "https://api.cline.bot/api/v1/auth/token"
+                host = self.headers.get("Host", f"127.0.0.1:{PORT}")
+                redirect_uri = f"http://{host}/api/oauth/cline/callback"
+                payload = json.dumps({
+                    "grant_type": "authorization_code",
+                    "code": raw_code,
+                    "client_type": "extension",
+                    "redirect_uri": redirect_uri,
+                }).encode("utf-8")
+                req = urllib.request.Request(
+                    exchange_url,
+                    data=payload,
+                    headers={"Content-Type": "application/json", "Accept": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    resp_json = json.loads(resp.read().decode("utf-8"))
+                    data = resp_json.get("data", resp_json)
+                    token_data = {
+                        "accessToken": data.get("accessToken") or data.get("access_token"),
+                        "refreshToken": data.get("refreshToken") or data.get("refresh_token"),
+                        "email": data.get("userInfo", {}).get("email") or data.get("email", ""),
+                        "expiresAt": data.get("expiresAt") or data.get("expires_at"),
+                    }
+            except Exception as exchange_err:
+                logger.warning(f"Cline HTTP token exchange fallback: {exchange_err}")
+
+        access_token = ""
+        refresh_token = ""
+        user_email = ""
+        first_name = ""
+        last_name = ""
+        expires_at = ""
+
+        if token_data:
+            access_token = token_data.get("accessToken") or token_data.get("access_token") or ""
+            refresh_token = token_data.get("refreshToken") or token_data.get("refresh_token") or ""
+            user_email = token_data.get("email") or token_data.get("userInfo", {}).get("email") or ""
+            first_name = token_data.get("firstName") or ""
+            last_name = token_data.get("lastName") or ""
+            expires_at = str(token_data.get("expiresAt") or token_data.get("expires_at") or "")
+
+        if not user_email:
+            # Fallback to local session email
+            try:
+                local_prov = Path.home() / ".cline" / "data" / "settings" / "providers.json"
+                if local_prov.exists():
+                    p_data = json.loads(local_prov.read_text(encoding="utf-8"))
+                    c_auth = p_data.get("providers", {}).get("cline", {}).get("settings", {}).get("auth", {})
+                    user_email = c_auth.get("email", "")
+            except Exception:
+                pass
+
+        if not user_email:
+            user_email = "cline-user@agentic.ai"
+
+        # Determine target account_id
+        state_param = (params.get("state") or [""])[0].strip()
+        account_param = (params.get("account_id") or [""])[0].strip()
+        account_id = ""
+        if account_param:
+            account_id = sanitize_account_id(account_param)
+        elif state_param:
+            sess = wizard_manager.get(state_param)
+            if sess and sess.provider_id == "cline":
+                account_id = sess.account_id
+
+        if not account_id:
+            account_id = wizard_manager.next_account_id("cline")
+
+        # Setup isolated profile storage
+        profile_base = Path.home() / ".mission-control" / "cline" / account_id
+        target_settings = profile_base / "data" / "settings"
+        target_settings.mkdir(parents=True, exist_ok=True)
+        target_settings.chmod(0o700)
+
+        isolated_cline_auth = {
+            "providers": {
+                "cline": {
+                    "settings": {
+                        "auth": {
+                            "accessToken": access_token or raw_code,
+                            "refreshToken": refresh_token,
+                            "email": user_email,
+                            "firstName": first_name,
+                            "lastName": last_name,
+                            "expiresAt": expires_at,
+                        }
+                    }
+                }
+            }
+        }
+        prov_file = target_settings / "providers.json"
+        prov_file.write_text(json.dumps(isolated_cline_auth, indent=2), encoding="utf-8")
+        prov_file.chmod(0o600)
+
+        secrets_file = profile_base / "data" / "secrets.json"
+        secrets_file.parent.mkdir(parents=True, exist_ok=True)
+        secrets_file.write_text(json.dumps({"cline:token": access_token or raw_code}, indent=2), encoding="utf-8")
+        secrets_file.chmod(0o600)
+
+        account_conf = {
+            "account_id": account_id.replace("cline-", ""),
+            "agent_id": account_id,
+            "display_name": f"Cline ({user_email})",
+            "description": f"Cline account ({user_email} - WorkOS OAuth)",
+            "priority": 10,
+            "enabled": True,
+            "config_dir": str(profile_base / "config"),
+            "data_dir": str(profile_base / "data"),
+            "capabilities": [
+                "code_generation",
+                "code_review",
+                "refactoring",
+                "editor_refactoring",
+                "frontend_styling",
+                "component_refactoring",
+                "documentation",
+            ],
+            "models": [
+                "z-ai/glm-5.3-flash",
+                "deepseek/deepseek-v4-flash",
+                "anthropic/claude-fable-5.1",
+                "auto",
+            ],
+            "default_model": "z-ai/glm-5.3-flash",
+        }
+        add_account_config("cline", account_id, account_conf)
+        ensure_registry_synced(force=True)
+
+        if state_param:
+            sess = wizard_manager.get(state_param)
+            if sess:
+                sess.step = "complete"
+                sess.completed = True
+
+        event_bus.emit(
+            Event(
+                event_type=EventType.ACCOUNT_REGISTERED,
+                agent_id=account_id,
+                provider="cline",
+                metadata={"account_id": account_id, "email": user_email, "auth_method": "workos_oauth"},
+            )
+        )
+
+        self._serve_html_content(f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Cline Connected Successfully</title>
+  <style>
+    body {{ font-family: system-ui, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #0b0f19; color: #f8fafc; }}
+    .card {{ text-align: center; padding: 2.5rem; background: #1e293b; border-radius: 12px; border: 1px solid #10b981; max-width: 440px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }}
+    .check {{ font-size: 3rem; color: #10b981; line-height: 1; margin-bottom: 1rem; }}
+    h1 {{ font-size: 1.25rem; margin: 0 0 0.5rem; }}
+    p {{ color: #94a3b8; font-size: 0.875rem; margin: 0 0 1rem; }}
+    .email {{ font-family: monospace; color: #818cf8; font-weight: 600; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="check">✓</div>
+    <h1>Cline Connected Successfully!</h1>
+    <p>Logged in as <span class="email">{html.escape(user_email)}</span>.</p>
+    <p>Account <b>{html.escape(account_id)}</b> is registered & ONLINE!</p>
+    <a href="/?oauth_complete=1&account_id={urllib.parse.quote(account_id)}" style="display:inline-block; margin-top:0.75rem; padding:0.5rem 1.25rem; background:#4f46e5; color:#ffffff; text-decoration:none; border-radius:6px; font-size:0.875rem; font-weight:600;">Return to Mission Control</a>
+  </div>
+  <script>
+    if (window.opener) {{
+      try {{ window.opener.postMessage({{ type: 'cline_oauth_complete', wizard_id: '{html.escape(state_param)}', account_id: '{html.escape(account_id)}', email: '{html.escape(user_email)}' }}, '*'); }} catch (e) {{}}
+      setTimeout(() => {{ window.close(); }}, 1200);
+    }} else {{
+      setTimeout(() => {{
+        window.location.href = '/?oauth_complete=1&account_id={urllib.parse.quote(account_id)}';
+      }}, 1200);
+    }}
+  </script>
+</body>
+</html>""")
+
+    def _handle_kiro_auto_import(self) -> None:
+        """Auto-detect Kiro credentials from ~/.aws/sso/cache or ~/.local/share/kiro-cli.
+
+        Matches OmniRoute auto-import parity: inspects active SSO cache files and
+        kiro-cli SQLite store to detect cached Builder ID, IAM Identity Center (IdC),
+        or external IdP tokens.
+        """
+        sso_cache_dir = Path.home() / ".aws" / "sso" / "cache"
+        kiro_data_db = Path.home() / ".local" / "share" / "kiro-cli" / "data.sqlite3"
+
+        res = {
+            "found": False,
+            "source": "",
+            "authMethod": "idc",
+            "region": "us-east-1",
+            "startUrl": "",
+            "hasRefreshToken": False,
+            "hasAccessToken": False,
+            "expiresAt": "",
+            "message": "",
+        }
+
+        # 1. Probe ~/.aws/sso/cache
+        if sso_cache_dir.exists() and sso_cache_dir.is_dir():
+            candidate_files = []
+            pref = sso_cache_dir / "kiro-auth-token.json"
+            if pref.exists():
+                candidate_files.append(pref)
+            try:
+                for f in sorted(sso_cache_dir.glob("*.json")):
+                    if f != pref:
+                        candidate_files.append(f)
+            except Exception:
+                pass
+
+            for cf in candidate_files:
+                try:
+                    data = json.loads(cf.read_text(encoding="utf-8"))
+                    ref_token = data.get("refreshToken") or ""
+                    acc_token = data.get("accessToken") or ""
+                    if ref_token or acc_token:
+                        res["found"] = True
+                        res["source"] = cf.name
+                        res["authMethod"] = data.get("authMethod") or "IdC"
+                        res["region"] = data.get("region") or "us-east-1"
+                        res["startUrl"] = data.get("startUrl") or ""
+                        res["hasRefreshToken"] = bool(ref_token)
+                        res["hasAccessToken"] = bool(acc_token)
+                        res["expiresAt"] = data.get("expiresAt") or ""
+                        res["message"] = f"Detected cached {res['authMethod']} session ({res['region']}) in {cf.name}"
+                        break
+                except Exception:
+                    pass
+
+        # 2. Probe ~/.local/share/kiro-cli/data.sqlite3 if not found in SSO cache
+        if not res["found"] and kiro_data_db.exists():
+            try:
+                import sqlite3
+                conn = sqlite3.connect(f"file:{kiro_data_db}?mode=ro", uri=True)
+                cursor = conn.cursor()
+                for table in ("auth_kv", "ItemTable", "storage"):
+                    try:
+                        cursor.execute(f"SELECT value FROM {table} WHERE key IN ('kirocli:odic:token', 'kirocli:oidc:token', 'kiro:auth:token') LIMIT 1")
+                        row = cursor.fetchone()
+                        if row and row[0]:
+                            t_data = json.loads(row[0])
+                            if t_data.get("refresh_token") or t_data.get("access_token"):
+                                res["found"] = True
+                                res["source"] = "kiro-cli SQLite"
+                                res["authMethod"] = "local_session"
+                                res["region"] = t_data.get("region") or "us-east-1"
+                                res["hasRefreshToken"] = bool(t_data.get("refresh_token"))
+                                res["hasAccessToken"] = bool(t_data.get("access_token"))
+                                res["expiresAt"] = t_data.get("expires_at") or ""
+                                res["message"] = f"Detected Kiro SQLite session ({res['region']})"
+                                break
+                    except Exception:
+                        pass
+                conn.close()
+            except Exception:
+                pass
+
+        if not res["found"]:
+            res["error"] = "No cached Kiro credentials found in ~/.aws/sso/cache or ~/.local/share/kiro-cli. Run `kiro-cli login` or paste your token."
+
+        self._serve_json(res)
 
     def _serve_html(self) -> None:
         html = """<!DOCTYPE html>
@@ -6577,10 +7085,18 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
               let badge = '';
               if (m.id === 'local_session') {
                 badge = `<span class="text-[10px] bg-emerald-950/80 border border-emerald-700/70 text-emerald-300 font-semibold px-2 py-0.5 rounded">Zero-Key / Active Session</span>`;
+              } else if (m.id === 'idc') {
+                badge = `<span class="text-[10px] bg-purple-950/80 border border-purple-700/70 text-purple-300 font-semibold px-2 py-0.5 rounded">Enterprise SSO / IDC</span>`;
               } else if (m.id === 'oauth') {
                 badge = `<span class="text-[10px] bg-indigo-950/80 border border-indigo-700/70 text-indigo-300 font-semibold px-2 py-0.5 rounded">Browser OAuth</span>`;
               } else if (m.id === 'device_code') {
                 badge = `<span class="text-[10px] bg-cyan-950/80 border border-cyan-700/70 text-cyan-300 font-semibold px-2 py-0.5 rounded">AWS Device Code</span>`;
+              } else if (m.id === 'google') {
+                badge = `<span class="text-[10px] bg-blue-950/80 border border-blue-700/70 text-blue-300 font-semibold px-2 py-0.5 rounded">Google Social</span>`;
+              } else if (m.id === 'github') {
+                badge = `<span class="text-[10px] bg-slate-800 border border-slate-600 text-slate-200 font-semibold px-2 py-0.5 rounded">GitHub Social</span>`;
+              } else if (m.id === 'import') {
+                badge = `<span class="text-[10px] bg-amber-950/80 border border-amber-700/70 text-amber-300 font-semibold px-2 py-0.5 rounded">SSO Cache / Import</span>`;
               } else if (m.id === 'api_key') {
                 badge = `<span class="text-[10px] bg-slate-800 border border-slate-700 text-slate-400 px-2 py-0.5 rounded">Manual Key</span>`;
               }
@@ -6606,6 +7122,10 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
         const isLocalSession = wizState.auth_method === 'local_session';
         const isOAuth = wizState.auth_method === 'oauth';
         const isDeviceCode = wizState.auth_method === 'device_code';
+        const isIdc = wizState.auth_method === 'idc';
+        const isGoogle = wizState.auth_method === 'google';
+        const isGithub = wizState.auth_method === 'github';
+        const isImport = wizState.auth_method === 'import';
         const isApiKey = wizState.auth_method === 'api_key';
 
         let defaultBaseUrl = '';
@@ -6672,9 +7192,12 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
                 </div>
                 <p class="text-xs text-slate-300">Authorize Cline via official WorkOS OAuth. No manual API key required.</p>
                 <div class="flex items-center gap-3">
-                  <a href="https://api.cline.bot/api/v1/auth/authorize?client_type=extension&callback_url=http%3A%2F%2F127.0.0.1%3A3333%2Fapi%2Foauth%2Fcline%2Fcallback" target="_blank" class="inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded transition cursor-pointer">
-                    Sign In with Cline &rarr;
-                  </a>
+                  <button type="button" onclick="wizLaunchClineOAuth(false)" class="inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded transition cursor-pointer">
+                    <i class="fa-brands fa-chrome"></i> Sign In with Cline (Popup)
+                  </button>
+                  <button type="button" onclick="wizLaunchClineOAuth(true)" class="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded border border-slate-700 transition cursor-pointer">
+                    Direct Redirect &rarr;
+                  </button>
                 </div>
                 <p class="text-[10px] text-slate-500">Or click <b>Next</b> to link your existing local session automatically.</p>
               </div>
@@ -6703,25 +7226,140 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
                 <div class="text-[10px] text-emerald-400/80 mt-1">⚡ CLI models and terminal capabilities configured automatically.</div>
               </div>
             `;
-          } else if (isDeviceCode) {
+          } else if (isIdc) {
             customFields = `
-              <div class="mt-3 p-4 bg-slate-900 border border-indigo-500/40 rounded-lg space-y-3">
+              <div class="mt-3 p-4 bg-slate-900 border border-purple-500/40 rounded-lg space-y-3">
                 <div class="flex items-center justify-between">
                   <span class="text-sm font-semibold text-slate-100 flex items-center gap-2">
-                    <i class="fa-brands fa-aws text-indigo-400"></i> AWS Builder ID / Device Code
+                    <i class="fa-solid fa-building text-purple-400"></i> AWS IAM Identity Center (Organization SSO)
                   </span>
-                  <span class="text-xs text-indigo-300 bg-indigo-950/80 px-2 py-0.5 rounded border border-indigo-700/70">Browser Verification</span>
+                  <span class="text-xs text-purple-300 bg-purple-950/80 px-2 py-0.5 rounded border border-purple-700/70">Enterprise Login</span>
+                </div>
+                <p class="text-xs text-slate-300">Sign in with your enterprise AWS IAM Identity Center portal (Start URL & Region).</p>
+                <div>
+                  <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1">Organization Start URL <span class="text-rose-400">*</span></label>
+                  <input id="wiz-start-url" placeholder="https://your-org.awsapps.com/start" value="${wizState.start_url || ''}" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono text-xs">
+                  <p class="text-[10px] text-slate-500 mt-0.5">Your organization's AWS SSO portal URL (e.g. https://my-org.awsapps.com/start).</p>
+                </div>
+                <div>
+                  <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1">AWS Region</label>
+                  <select id="wiz-region" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 text-xs">
+                    <option value="us-east-1" ${wizState.region === 'us-east-1' || !wizState.region ? 'selected' : ''}>us-east-1 (US East - N. Virginia)</option>
+                    <option value="us-west-2" ${wizState.region === 'us-west-2' ? 'selected' : ''}>us-west-2 (US West - Oregon)</option>
+                    <option value="eu-west-1" ${wizState.region === 'eu-west-1' ? 'selected' : ''}>eu-west-1 (Europe - Ireland)</option>
+                    <option value="eu-central-1" ${wizState.region === 'eu-central-1' ? 'selected' : ''}>eu-central-1 (Europe - Frankfurt)</option>
+                    <option value="ap-southeast-1" ${wizState.region === 'ap-southeast-1' ? 'selected' : ''}>ap-southeast-1 (Asia Pacific - Singapore)</option>
+                    <option value="ap-northeast-1" ${wizState.region === 'ap-northeast-1' ? 'selected' : ''}>ap-northeast-1 (Asia Pacific - Tokyo)</option>
+                  </select>
+                </div>
+                <div class="flex items-center gap-2 pt-1">
+                  <button type="button" onclick="wizDetectKiroCache(true)" class="px-3 py-1.5 bg-purple-900/60 hover:bg-purple-800/70 text-purple-200 text-xs font-semibold rounded border border-purple-700/60 transition cursor-pointer flex items-center gap-1.5">
+                    <i class="fa-solid fa-bolt"></i> Auto-Detect from Local SSO Cache
+                  </button>
+                  <span id="wiz-kiro-detect-status" class="text-[11px] text-slate-400 font-mono"></span>
+                </div>
+              </div>
+            `;
+          } else if (isGoogle) {
+            customFields = `
+              <div class="mt-3 p-4 bg-slate-900 border border-blue-500/40 rounded-lg space-y-3">
+                <div class="flex items-center justify-between">
+                  <div class="flex items-center gap-2">
+                    <svg class="w-5 h-5" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"/></svg>
+                    <span class="text-sm font-semibold text-slate-100">Google Account (Social Login)</span>
+                  </div>
+                  <span class="text-xs text-blue-300 bg-blue-950/80 px-2 py-0.5 rounded border border-blue-700/70">Kiro Desktop Auth</span>
+                </div>
+                <p class="text-xs text-slate-300">Sign in with your Google account via Kiro Desktop auth service.</p>
+                <div class="flex items-center gap-3 pt-1">
+                  <button type="button" onclick="wizLaunchKiroSocial('Google')" class="px-4 py-2 bg-white hover:bg-slate-100 text-slate-900 text-xs font-semibold rounded shadow-md flex items-center gap-2 transition cursor-pointer">
+                    <svg class="w-4 h-4" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"/></svg>
+                    Sign In with Google (Browser)
+                  </button>
+                  <button type="button" onclick="wizDetectKiroCache(false)" class="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded border border-slate-700 transition cursor-pointer">
+                    Verify Local Cache
+                  </button>
+                </div>
+                <div id="wiz-kiro-detect-status" class="text-[11px] text-slate-400 font-mono"></div>
+              </div>
+            `;
+          } else if (isGithub) {
+            customFields = `
+              <div class="mt-3 p-4 bg-slate-900 border border-slate-700 rounded-lg space-y-3">
+                <div class="flex items-center justify-between">
+                  <span class="text-sm font-semibold text-slate-100 flex items-center gap-2">
+                    <i class="fa-brands fa-github text-slate-200"></i> GitHub Account (Social Login)
+                  </span>
+                  <span class="text-xs text-slate-300 bg-slate-800 px-2 py-0.5 rounded border border-slate-600">Kiro Desktop Auth</span>
+                </div>
+                <p class="text-xs text-slate-300">Sign in with your GitHub account via Kiro Desktop auth service.</p>
+                <div class="flex items-center gap-3 pt-1">
+                  <button type="button" onclick="wizLaunchKiroSocial('Github')" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-white text-xs font-semibold rounded border border-slate-600 shadow-md flex items-center gap-2 transition cursor-pointer">
+                    <i class="fa-brands fa-github text-base"></i> Sign In with GitHub (Browser)
+                  </button>
+                  <button type="button" onclick="wizDetectKiroCache(false)" class="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded border border-slate-700 transition cursor-pointer">
+                    Verify Local Cache
+                  </button>
+                </div>
+                <div id="wiz-kiro-detect-status" class="text-[11px] text-slate-400 font-mono"></div>
+              </div>
+            `;
+          } else if (isImport) {
+            customFields = `
+              <div class="mt-3 p-4 bg-slate-900 border border-amber-500/40 rounded-lg space-y-3">
+                <div class="flex items-center justify-between">
+                  <span class="text-sm font-semibold text-slate-100 flex items-center gap-2">
+                    <i class="fa-solid fa-file-import text-amber-400"></i> Import Token / AWS SSO Cache
+                  </span>
+                  <span class="text-xs text-amber-300 bg-amber-950/80 px-2 py-0.5 rounded border border-amber-700/70">Auto-Detect / Manual</span>
+                </div>
+                <p class="text-xs text-slate-300">Auto-detect cached credentials from ~/.aws/sso/cache or paste your refresh token.</p>
+                <div class="flex items-center gap-2">
+                  <button type="button" onclick="wizDetectKiroCache(true)" class="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold rounded transition cursor-pointer flex items-center gap-1.5">
+                    <i class="fa-solid fa-rotate"></i> Auto-Detect Local Token
+                  </button>
+                  <span id="wiz-kiro-detect-status" class="text-[11px] text-slate-300 font-mono"></span>
+                </div>
+                <div>
+                  <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-2">Refresh Token / Access Token (Optional if auto-detected)</label>
+                  <textarea id="wiz-refresh-token" placeholder="Paste your Kiro / AWS refresh token (aorAAAAAG...)" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono text-xs h-16"></textarea>
+                </div>
+              </div>
+            `;
+          } else if (isDeviceCode) {
+            customFields = `
+              <div class="mt-3 p-4 bg-slate-900 border border-cyan-500/40 rounded-lg space-y-3">
+                <div class="flex items-center justify-between">
+                  <span class="text-sm font-semibold text-slate-100 flex items-center gap-2">
+                    <i class="fa-brands fa-aws text-cyan-400"></i> AWS Builder ID (Personal Account)
+                  </span>
+                  <span class="text-xs text-cyan-300 bg-cyan-950/80 px-2 py-0.5 rounded border border-cyan-700/70">Device Code Flow</span>
                 </div>
                 <p class="text-xs text-slate-300">Authenticate Kiro via AWS Builder ID OIDC device authorization.</p>
-                <a href="https://oidc.us-east-1.amazonaws.com" target="_blank" class="inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded transition cursor-pointer">
-                  Open AWS Builder ID &rarr;
-                </a>
+                <div class="flex items-center gap-3">
+                  <a href="https://view.awsapps.com/start" target="_blank" class="inline-flex items-center gap-2 px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold rounded transition cursor-pointer">
+                    Open AWS Builder ID &rarr;
+                  </a>
+                  <button type="button" onclick="wizDetectKiroCache(false)" class="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded border border-slate-700 transition cursor-pointer">
+                    Verify Token
+                  </button>
+                </div>
+                <div id="wiz-kiro-detect-status" class="text-[11px] text-slate-400 font-mono"></div>
               </div>
             `;
           } else {
             customFields = `
-              <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-3">Custom Session Key (Optional)</label>
-              <input id="wiz-key" type="password" placeholder="session token..." class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono text-xs">
+              <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-3">AWS Region</label>
+              <select id="wiz-region" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 text-xs">
+                <option value="us-east-1" selected>us-east-1 (US East - N. Virginia)</option>
+                <option value="us-west-2">us-west-2 (US West - Oregon)</option>
+                <option value="eu-west-1">eu-west-1 (Europe - Ireland)</option>
+                <option value="eu-central-1">eu-central-1 (Europe - Frankfurt)</option>
+                <option value="ap-southeast-1">ap-southeast-1 (Asia Pacific - Singapore)</option>
+                <option value="ap-northeast-1">ap-northeast-1 (Asia Pacific - Tokyo)</option>
+              </select>
+              <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-3">Custom Session Key / Bearer Token</label>
+              <input id="wiz-key" type="password" placeholder="session token or bearer token..." class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono text-xs">
             `;
           }
         } else if (isApiKey || ['openai', 'anthropic', 'gemini', 'gemini-api', 'openrouter', 'groq', 'ollama'].includes(wizState.provider_id)) {
@@ -6748,6 +7386,9 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
               <input id="wiz-priority" type="number" value="10" min="1" max="100" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200"></div>
           </div>
           ${customFields}`;
+        if (isKiro && (isImport || isIdc)) {
+          setTimeout(() => { wizDetectKiroCache(true); }, 150);
+        }
       } else if (wizState.step === 'authenticate') {
         const isAntigravity = wizState.provider_id === 'antigravity';
         const isCline = wizState.provider_id === 'cline';
@@ -6782,12 +7423,23 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
             <div class="text-[11px] text-slate-400">Click <b>Next</b> to allocate isolated profile and sync WorkOS OAuth credentials (Zero-Key).</div>
           `;
         } else if (isKiro) {
+          let mName = 'kiro-cli Local Engine (Zero-Key)';
+          if (wizState.auth_method === 'idc') mName = 'AWS IAM Identity Center (Organization SSO)';
+          else if (wizState.auth_method === 'google') mName = 'Google Account (Social Login)';
+          else if (wizState.auth_method === 'github') mName = 'GitHub Account (Social Login)';
+          else if (wizState.auth_method === 'import') mName = 'AWS SSO Cache / Token Import';
+          else if (wizState.auth_method === 'device_code') mName = 'AWS Builder ID (Device Code)';
+          else if (wizState.auth_method === 'api_key') mName = 'Custom Session Key';
+
           authSummary = `
             <div class="bg-slate-950 border border-slate-800 rounded p-3 text-xs space-y-1.5 font-mono">
               <div><span class="text-slate-500">Account ID:</span> <span class="text-slate-200">${wizState.account_id}</span></div>
+              <div><span class="text-slate-500">Auth Method:</span> <span class="text-indigo-300 font-semibold">${mName}</span></div>
               <div><span class="text-slate-500">Runtime:</span> <span class="text-emerald-400">~/.local/bin/kiro-cli (v2.20.2)</span></div>
+              ${wizState.region ? `<div><span class="text-slate-500">AWS Region:</span> <span class="text-slate-200">${wizState.region}</span></div>` : ''}
+              ${wizState.start_url ? `<div><span class="text-slate-500">Start URL:</span> <span class="text-slate-200">${wizState.start_url}</span></div>` : ''}
             </div>
-            <div class="text-[11px] text-slate-400">Click <b>Next</b> to verify the kiro-cli engine and models. Zero API key needed.</div>
+            <div class="text-[11px] text-slate-400">Click <b>Next</b> to authenticate and verify Kiro capabilities & models.</div>
           `;
         }
         body.innerHTML = `
@@ -6874,6 +7526,28 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
             cfg.api_key = keyEl.value.trim();
             cfg.auth_token = keyEl.value.trim();
           }
+          const startUrlEl = document.getElementById('wiz-start-url');
+          if (startUrlEl && startUrlEl.value.trim()) {
+            cfg.start_url = startUrlEl.value.trim();
+            wizState.start_url = cfg.start_url;
+          }
+          const regionEl = document.getElementById('wiz-region');
+          if (regionEl && regionEl.value.trim()) {
+            cfg.region = regionEl.value.trim();
+            wizState.region = cfg.region;
+          }
+          const refEl = document.getElementById('wiz-refresh-token');
+          if (refEl && refEl.value.trim()) {
+            cfg.refresh_token = refEl.value.trim();
+            cfg.api_key = refEl.value.trim();
+          }
+
+          if (wizState.provider_id === 'kiro' && wizState.auth_method === 'idc') {
+            if (!cfg.start_url) {
+              wizShowError('Organization Start URL is required for IAM Identity Center login.');
+              return;
+            }
+          }
 
           // If Antigravity and not authenticated yet, immediately launch Google sign-in
           if (wizState.provider_id === 'antigravity') {
@@ -6888,6 +7562,7 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
 
           const r = await wizPost('configure', { config: cfg });
           if (keyEl) keyEl.value = '';  // never keep the secret in the DOM
+          if (refEl) refEl.value = '';
           if (!r.ok) { wizShowError(r.d.error || ('HTTP ' + r.status)); return; }
           wizState.step = 'authenticate';
         } else if (wizState.step === 'authenticate') {
@@ -7058,6 +7733,72 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
       } catch (e) {}
     }
 
+    function wizLaunchClineOAuth(direct) {
+      const cb = encodeURIComponent(window.location.origin + '/api/oauth/cline/callback');
+      const aid = encodeURIComponent(wizState?.account_id || '');
+      const wid = encodeURIComponent(wizState?.wizard_id || '');
+      const authUrl = `https://api.cline.bot/api/v1/auth/authorize?client_type=extension&callback_url=${cb}&state=${wid}&account_id=${aid}`;
+      if (direct) {
+        window.location.href = authUrl;
+      } else {
+        const w = 600, h = 700;
+        const left = window.screenLeft + (window.innerWidth - w) / 2;
+        const top = window.screenTop + (window.innerHeight - h) / 2;
+        window._oauthPopup = window.open(authUrl, 'ClineOAuth', `width=${w},height=${h},top=${top},left=${left}`);
+      }
+    }
+
+    async function wizDetectKiroCache(autoFill) {
+      const statusEl = document.getElementById('wiz-kiro-detect-status');
+      if (statusEl) statusEl.innerHTML = '<span class="text-amber-400"><i class="fa-solid fa-spinner fa-spin"></i> Checking local AWS SSO cache...</span>';
+      try {
+        const res = await fetchWithAuth('/api/oauth/kiro/auto-import');
+        const data = await res.json().catch(() => ({}));
+        if (data.found) {
+          if (statusEl) {
+            statusEl.innerHTML = `<span class="text-emerald-400 font-semibold">✓ Detected ${data.authMethod || 'Kiro'} cache in ${data.source} (${data.region || 'us-east-1'})</span>`;
+          }
+          if (autoFill) {
+            const regEl = document.getElementById('wiz-region');
+            if (regEl && data.region) {
+              regEl.value = data.region;
+              if (wizState) wizState.region = data.region;
+            }
+            const urlEl = document.getElementById('wiz-start-url');
+            if (urlEl && data.startUrl) {
+              urlEl.value = data.startUrl;
+              if (wizState) wizState.start_url = data.startUrl;
+            }
+            const refEl = document.getElementById('wiz-refresh-token');
+            if (refEl && data.hasRefreshToken) {
+              refEl.placeholder = `Token detected in ${data.source} (${data.expiresAt ? 'expires ' + data.expiresAt : 'valid session'})`;
+            }
+          }
+          return data;
+        } else {
+          if (statusEl) {
+            statusEl.innerHTML = `<span class="text-amber-400">${data.error || 'No cached SSO token found.'}</span>`;
+          }
+          return null;
+        }
+      } catch (err) {
+        if (statusEl) statusEl.innerHTML = `<span class="text-rose-400">Error: ${err.message}</span>`;
+        return null;
+      }
+    }
+
+    function wizLaunchKiroSocial(idp) {
+      const url = 'https://prod.us-east-1.auth.desktop.kiro.dev/login?idp=' + encodeURIComponent(idp);
+      const w = 600, h = 700;
+      const left = window.screenLeft + (window.innerWidth - w) / 2;
+      const top = window.screenTop + (window.innerHeight - h) / 2;
+      window._oauthPopup = window.open(url, 'kiro_social_oauth', `width=${w},height=${h},top=${top},left=${left}`);
+      const statusEl = document.getElementById('wiz-kiro-detect-status');
+      if (statusEl) {
+        statusEl.innerHTML = `<span class="text-indigo-300">Opened ${idp} sign-in window. Complete login in browser, then click Verify Local Cache or Next.</span>`;
+      }
+    }
+
     window.addEventListener('message', async (event) => {
       if (event.data && event.data.type === 'google_oauth_complete') {
         if (window._oauthPopup && !window._oauthPopup.closed) {
@@ -7087,6 +7828,14 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
         } else if (wizState && wizState.step === 'authenticate') {
           setTimeout(wizNext, 400);
         }
+      } else if (event.data && event.data.type === 'cline_oauth_complete') {
+        if (window._oauthPopup && !window._oauthPopup.closed) {
+          try { window._oauthPopup.close(); } catch (e) {}
+        }
+        showToast('Cline connected successfully: ' + (event.data.email || event.data.account_id || ''), 'success');
+        wizClose();
+        if (typeof loadAccounts === 'function') loadAccounts();
+        if (typeof loadOverview === 'function') loadOverview();
       }
     });
 
