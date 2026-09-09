@@ -3164,13 +3164,13 @@ class MissionControlHandler(BaseHTTPRequestHandler):
         elif path == "/api/jobs":
             if not self._verify_auth(path):
                 return
-            task_text = payload.get("task", "").strip()
+            task_text = (payload.get("task") or "").strip()
             if not task_text:
                 self._serve_json({"error": "Missing 'task' field"}, status=400)
                 return
-            prov = payload.get("provider", "").strip()
-            acct = payload.get("account", "").strip()
-            mdl = payload.get("model", "").strip()
+            prov = (payload.get("provider") or "").strip()
+            acct = (payload.get("account") or "").strip()
+            mdl = (payload.get("model") or "").strip()
             mode = payload.get("routing_mode", "balanced")
             streaming = bool(payload.get("streaming", False))
             failover_enabled = bool(payload.get("failover_enabled", True))
