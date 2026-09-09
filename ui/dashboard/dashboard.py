@@ -11,6 +11,7 @@ rate limiting, CORS local-origin restriction, security headers, and worktree app
 from __future__ import annotations
 
 import atexit
+import base64
 import datetime
 import errno
 import hmac
@@ -24,6 +25,8 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
+import html
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
@@ -120,7 +123,10 @@ from agents.cline.auth import ClineAuthManager
 from agents.antigravity.auth import AntigravityAuthManager, TOKEN_FILENAME
 from agents.antigravity.adapter import AntigravityAdapter, AntigravityAccountAdapter
 from providers.registry.config import add_account_config, remove_account_config
-from providers.adapters.bridge import AgentProviderBridge
+from providers.adapters.bridge import AgentProviderBridge, AIProviderAgentAdapter
+from agents.cline.adapter import ClineAdapter
+from agents.kiro.adapter import KiroAdapter
+from providers.registry.provider_registry import Provider
 
 
 def _new_correlation_id() -> str:
@@ -328,6 +334,57 @@ class WizardSession:
         return redactor.redact_dict(d)
 
 
+def _get_antigravity_oauth_credentials() -> tuple[str, str]:
+    """Retrieve Antigravity Google OAuth Client ID and Secret dynamically."""
+    client_id = os.environ.get("ANTIGRAVITY_OAUTH_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("ANTIGRAVITY_OAUTH_CLIENT_SECRET", "").strip()
+    if client_id and client_secret:
+        return client_id, client_secret
+
+    try:
+        cm = get_credential_manager()
+        cid = cm.retrieve("secret://mission-control/oauth/antigravity/client_id") or ""
+        sec = cm.retrieve("secret://mission-control/oauth/antigravity/client_secret") or ""
+        if cid and sec:
+            return cid.strip(), sec.strip()
+    except Exception:
+        pass
+
+    paths = [
+        PROJECT_ROOT / "creds_oauth.json",
+        Path.home() / ".mission-control" / "creds_oauth.json",
+        Path("/tmp/omniroute/src/lib/oauth/providers/antigravity.ts"),
+    ]
+    for p in paths:
+        if p.is_file():
+            try:
+                if p.suffix == ".json":
+                    d = json.loads(p.read_text(encoding="utf-8"))
+                    cid = (d.get("client_id") or "").strip()
+                    csec = (d.get("client_secret") or "").strip()
+                    if cid and csec:
+                        return cid, csec
+                elif p.suffix == ".ts":
+                    content = p.read_text(encoding="utf-8")
+                    import re
+                    m_id = re.search(r'clientId:\s*["\']([^"\']+)["\']', content)
+                    m_sec = re.search(r'clientSecret:\s*["\']([^"\']+)["\']', content)
+                    if m_id and m_sec:
+                        return m_id.group(1).strip(), m_sec.group(1).strip()
+            except Exception:
+                pass
+
+    return "", ""
+
+ANTIGRAVITY_OAUTH_SCOPES = [
+    "https://www.googleapis.com/auth/cloud-platform",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
+    "https://www.googleapis.com/auth/cclog",
+    "https://www.googleapis.com/auth/experimentsandconfigs",
+]
+
+
 class WizardManager:
     """Drives Account Add Wizard sessions against the real lifecycle engine."""
 
@@ -335,13 +392,18 @@ class WizardManager:
     #: GUI profile and keyring slot are never touched by the wizard.
     _STATIC_AUTH_METHODS = {
         "antigravity": [
-            {"id": "oauth", "label": "Google OAuth (browser redirect / CLI login)"},
-            {"id": "api_key", "label": "Direct OAuth Token / Session Key"},
+            {"id": "oauth", "label": "Google Sign-In (Interactive Browser OAuth)"},
+            {"id": "api_key", "label": "Direct OAuth Token / Session Key (Manual / Headless)"},
         ],
         "openai": [{"id": "api_key", "label": "API Key"}],
         "anthropic": [{"id": "api_key", "label": "API Key"}],
         "gemini": [{"id": "api_key", "label": "API Key"}],
         "gemini-api": [{"id": "api_key", "label": "API Key"}],
+        "openrouter": [{"id": "api_key", "label": "API Key"}],
+        "groq": [{"id": "api_key", "label": "API Key"}],
+        "ollama": [{"id": "api_key", "label": "Endpoint / Local Server"}],
+        "kiro": [{"id": "api_key", "label": "Local CLI Session / API Key"}],
+        "cline": [{"id": "api_key", "label": "API Key (cline auth / config)"}],
     }
 
     #: Router-valid default capabilities applied at registration when the
@@ -379,13 +441,11 @@ class WizardManager:
 
     # ---- auth-method discovery -------------------------------------------
     def auth_methods_for(self, provider_id: str) -> list[dict[str, str]]:
-        """Return ONLY the auth methods actually supported by the provider.
+        """Return the auth methods supported by the provider.
 
-        For Cline this is derived from live capability discovery of the installed
-        CLI (``cline --version`` / ``cline auth --help``); an uninstalled or
-        unsupported method is never offered. For Antigravity it is OAuth only. For
-        direct API providers it is an API key. Anything else falls back to a
-        generic API-key method so the wizard is still usable.
+        For Cline, checks live capability discovery; falls back to direct API key.
+        For Antigravity, defaults to Interactive Google OAuth.
+        For API providers and agents, returns standard authentication methods.
         """
         pid = (provider_id or "").lower().strip()
         if pid == "cline":
@@ -393,17 +453,19 @@ class WizardManager:
                 caps = ClineAuthManager().discover_capabilities()
             except Exception:
                 caps = None
-            if not caps or caps.version == "not_installed" or not caps.has_auth_command:
-                return []
             methods: list[dict[str, str]] = []
-            # A key-based method is only offered if the installed CLI exposes a
-            # key flag; base_url/model are surfaced as optional config later.
-            if "-k" in caps.auth_flags or "--apikey" in caps.auth_flags:
+            if caps and caps.version != "not_installed" and caps.has_auth_command:
+                if "-k" in caps.auth_flags or "--apikey" in caps.auth_flags:
+                    methods.append({
+                        "id": "api_key",
+                        "label": "API Key via cline auth",
+                        "flags": [f for f in caps.auth_flags if f in ("-k", "-m", "-b", "--config", "--data-dir")],
+                        "cli_version": caps.version,
+                    })
+            if not methods:
                 methods.append({
                     "id": "api_key",
-                    "label": "API Key via cline auth",
-                    "flags": [f for f in caps.auth_flags if f in ("-k", "-m", "-b", "--config", "--data-dir")],
-                    "cli_version": caps.version,
+                    "label": "API Key (Direct / Headless)",
                 })
             return methods
         if pid in self._STATIC_AUTH_METHODS:
@@ -459,15 +521,34 @@ class WizardManager:
         sess.auth_method = method
         sess.step = "select_auth"
 
-    def launch_login(self, sess: WizardSession) -> dict[str, Any]:
-        """Prepare isolated environment and return the official CLI authentication command."""
+    def launch_login(self, sess: WizardSession, redirect_origin: str = "http://127.0.0.1:3333") -> dict[str, Any]:
+        """Prepare isolated environment and return the official Google OAuth authorization URL."""
         if sess.provider_id == "antigravity":
             mgr = AntigravityAuthManager()
             data_dir, profile_dir = mgr.create_isolated_profile(sess.account_id, sess.config.get("app_data_dir"))
             if str(profile_dir) not in sess.profile_dirs:
                 sess.profile_dirs.append(str(profile_dir))
+
+            email = sess.config.get("email") or (sess.account.metadata.get("email") if sess.account else "")
+            redirect_uri = f"{redirect_origin.rstrip('/')}/callback"
+            client_id, _ = _get_antigravity_oauth_credentials()
+            params = {
+                "client_id": client_id,
+                "response_type": "code",
+                "redirect_uri": redirect_uri,
+                "scope": " ".join(ANTIGRAVITY_OAUTH_SCOPES),
+                "state": sess.wizard_id,
+                "access_type": "offline",
+                "prompt": "consent",
+            }
+            if email:
+                params["login_hint"] = email
+            auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urllib.parse.urlencode(params)}"
+
             res = mgr.launch_auth(sess.account_id, data_dir)
-            res["email"] = sess.config.get("email", "")
+            res["auth_url"] = auth_url
+            res["redirect_uri"] = redirect_uri
+            res["email"] = email
             return res
         return {"success": True, "message": f"Direct authentication for {sess.provider_id}", "email": sess.config.get("email", "")}
 
@@ -693,7 +774,7 @@ class WizardManager:
         sess.registered = True
         sess.step = "register"
 
-        # OmniRoute-style Antigravity persistence & active routing pool registration
+        # OmniRoute-style persistence & active routing pool registration for ALL providers
         if sess.provider_id == "antigravity":
             app_data_dir = sess.config.get("app_data_dir") or (sess.account.metadata.get("data_dir") if sess.account else sess.account_id)
             email = sess.config.get("email") or (sess.account.metadata.get("email") if sess.account else "")
@@ -719,7 +800,7 @@ class WizardManager:
             }
             try:
                 add_account_config("antigravity", sess.account_id, account_conf)
-            except Exception as exc:
+            except Exception:
                 pass
 
             # Live-register adapter with Antigravity provider & AI bridge so router picks it up in real time
@@ -734,9 +815,140 @@ class WizardManager:
                     )
                     adapter = AntigravityAccountAdapter(adapter_cfg)
                     prov.add_adapter(adapter)
+                    registry.register_adapter("antigravity", adapter)
                     bridge = AgentProviderBridge(adapter)
                     registry.register_ai_provider(bridge)
-            except Exception as exc:
+            except Exception:
+                pass
+
+        elif sess.provider_id == "cline":
+            config_dir = sess.account.metadata.get("config_dir") or str(Path.home() / ".mission-control" / "cline" / sess.account_id / "config")
+            data_dir = sess.account.metadata.get("data_dir") or str(Path.home() / ".mission-control" / "cline" / sess.account_id / "data")
+            account_conf = {
+                "account_id": sess.account_id.replace("cline-", ""),
+                "agent_id": sess.account_id,
+                "display_name": acct.display_name,
+                "priority": acct.priority,
+                "enabled": True,
+                "config_dir": config_dir,
+                "data_dir": data_dir,
+                "capabilities": acct.capabilities,
+                "models": acct.models or ["deepseek/deepseek-v4-flash", "auto"],
+                "default_model": (acct.models[0] if acct.models else "deepseek/deepseek-v4-flash"),
+            }
+            try:
+                add_account_config("cline", sess.account_id, account_conf)
+            except Exception:
+                pass
+            try:
+                prov = registry.get_provider("cline")
+                if prov:
+                    adapter = ClineAdapter(
+                        agent_id=sess.account_id,
+                        account_id=sess.account_id,
+                        config_dir=config_dir,
+                        data_dir=data_dir,
+                        capabilities=frozenset(Capability(c) for c in acct.capabilities if c in [cap.value for cap in Capability]),
+                        models=tuple(acct.models) if acct.models else ("auto",),
+                    )
+                    prov.add_adapter(adapter)
+                    registry.register_adapter("cline", adapter)
+                    bridge = AgentProviderBridge(adapter)
+                    registry.register_ai_provider(bridge)
+            except Exception:
+                pass
+
+        elif sess.provider_id == "kiro":
+            account_conf = {
+                "account_id": sess.account_id.replace("kiro-", ""),
+                "agent_id": sess.account_id,
+                "display_name": acct.display_name,
+                "priority": acct.priority,
+                "enabled": True,
+                "capabilities": acct.capabilities,
+                "models": acct.models or ["auto"],
+                "default_model": (acct.models[0] if acct.models else "auto"),
+            }
+            try:
+                add_account_config("kiro", sess.account_id, account_conf)
+            except Exception:
+                pass
+            try:
+                prov = registry.get_provider("kiro")
+                if prov:
+                    adapter = KiroAdapter(
+                        agent_id=sess.account_id,
+                        account_id=sess.account_id,
+                    )
+                    prov.add_adapter(adapter)
+                    registry.register_adapter("kiro", adapter)
+                    bridge = AgentProviderBridge(adapter)
+                    registry.register_ai_provider(bridge)
+            except Exception:
+                pass
+
+        else:
+            pid = sess.provider_id
+            base_url = sess.config.get("base_url") or APIProviderOnboarder.resolve_endpoint(pid)
+            account_conf = {
+                "account_id": sess.account_id,
+                "agent_id": sess.account_id,
+                "provider_id": pid,
+                "display_name": acct.display_name,
+                "priority": acct.priority,
+                "enabled": True,
+                "base_url": base_url,
+                "credential_reference": sess.credential_reference or "",
+                "capabilities": acct.capabilities,
+                "models": acct.models or [],
+                "default_model": (acct.models[0] if acct.models else "default"),
+            }
+            try:
+                add_account_config(pid, sess.account_id, account_conf)
+            except Exception:
+                pass
+
+            try:
+                ai_prov = registry.get_ai_provider(pid)
+                if not ai_prov:
+                    if pid in ("gemini", "gemini-api"):
+                        ai_prov = GeminiProvider(provider_id=pid, default_model=account_conf["default_model"])
+                    elif pid == "anthropic":
+                        ai_prov = AnthropicProvider(provider_id=pid, default_model=account_conf["default_model"])
+                    elif pid == "ollama":
+                        ai_prov = OllamaProvider(provider_id=pid, base_url=base_url, default_model=account_conf["default_model"])
+                    else:
+                        ai_prov = OpenAICompatibleProvider(
+                            provider_id=pid,
+                            base_url=base_url,
+                            credential_reference=sess.credential_reference or "",
+                            default_model=account_conf["default_model"],
+                            models=tuple(acct.models) if acct.models else ("default",),
+                            display_name=acct.display_name,
+                        )
+                    registry.register_ai_provider(ai_prov)
+
+                prov = registry.get_provider(pid)
+                if not prov:
+                    prov = Provider(
+                        id=pid,
+                        name=pid.capitalize(),
+                        description=f"{pid.capitalize()} Provider",
+                        enabled=True,
+                    )
+                    registry.register_provider(prov)
+
+                api_adapter = AIProviderAgentAdapter(
+                    ai_provider=ai_prov,
+                    agent_id=sess.account_id,
+                    account_id=sess.account_id,
+                    capabilities=frozenset(Capability(c) for c in acct.capabilities if c in [cap.value for cap in Capability]),
+                    models=tuple(acct.models) if acct.models else (account_conf["default_model"],),
+                    default_model=account_conf["default_model"],
+                )
+                prov.add_adapter(api_adapter)
+                registry.register_adapter(pid, api_adapter)
+            except Exception:
                 pass
 
         wizard_event_stream.emit(
@@ -1041,6 +1253,7 @@ def validate_host_binding(host: str) -> str:
 
 PUBLIC_GET_PATHS = frozenset({
     "/",
+    "/callback",
     "/api/health",
     "/api/status",
     "/api/token",
@@ -1573,6 +1786,8 @@ class MissionControlHandler(BaseHTTPRequestHandler):
 
         if path == "/":
             self._serve_html()
+        elif path == "/callback":
+            self._handle_oauth_callback()
         elif path.startswith("/static/"):
             self._serve_static(path)
         elif path == "/api/overview":
@@ -1612,10 +1827,10 @@ class MissionControlHandler(BaseHTTPRequestHandler):
         # any key matching /auth/ — does not blank out this non-secret data. The
         # method values are plain enum strings such as "api_key" / "oauth".
         elif path == "/api/wizard/providers":
-            # Provider Registry UI data: one entry per provider with the login
-            # methods actually supported (Cline via live capability discovery).
             entries = []
+            seen = set()
             for p in registry.list_providers():
+                seen.add(p.id)
                 entries.append({
                     "id": p.id,
                     "name": p.name,
@@ -1624,13 +1839,36 @@ class MissionControlHandler(BaseHTTPRequestHandler):
                     "login_methods": wizard_manager.auth_methods_for(p.id),
                 })
             for ai_prov in registry.list_ai_providers():
-                if not any(e["id"] == ai_prov.provider_id for e in entries):
+                if ai_prov.provider_id not in seen:
+                    seen.add(ai_prov.provider_id)
                     entries.append({
                         "id": ai_prov.provider_id,
                         "name": ai_prov.display_name,
                         "type": ai_prov.provider_type.value.upper(),
                         "account_count": len(registry.account_registry.list_accounts(ai_prov.provider_id)),
                         "login_methods": wizard_manager.auth_methods_for(ai_prov.provider_id),
+                    })
+            # Standard preset providers available to onboard anytime
+            KNOWN_PRESETS = [
+                ("antigravity", "Google Antigravity", "IDE"),
+                ("openai", "OpenAI", "API"),
+                ("anthropic", "Anthropic Claude", "API"),
+                ("gemini", "Google Gemini", "API"),
+                ("openrouter", "OpenRouter", "GATEWAY"),
+                ("groq", "Groq Cloud", "API"),
+                ("cline", "Cline", "AGENT"),
+                ("kiro", "Kiro", "AGENT"),
+                ("ollama", "Ollama (local)", "LOCAL_MODEL"),
+            ]
+            for pid, name, ptype in KNOWN_PRESETS:
+                if pid not in seen:
+                    seen.add(pid)
+                    entries.append({
+                        "id": pid,
+                        "name": name,
+                        "type": ptype,
+                        "account_count": len(registry.account_registry.list_accounts(pid)),
+                        "login_methods": wizard_manager.auth_methods_for(pid),
                     })
             self._serve_json({"providers": entries, "count": len(entries)})
         elif path in ("/api/wizard/login-methods", "/api/wizard/auth-methods"):
@@ -2829,13 +3067,17 @@ class MissionControlHandler(BaseHTTPRequestHandler):
                 return
             try:
                 if action == "select-auth":
-                    wizard_manager.select_auth(sess, (payload.get("auth_method") or "").strip())
+                    auth_m = (payload.get("auth_method") or payload.get("login_method") or "").strip()
+                    wizard_manager.select_auth(sess, auth_m)
                     self._serve_json({"status": "ok", "wizard": sess.to_dict()})
                 elif action == "configure":
                     wizard_manager.configure(sess, dict(payload.get("config") or payload))
                     self._serve_json({"status": "ok", "wizard": sess.to_dict()})
                 elif action == "launch-login":
-                    info = wizard_manager.launch_login(sess)
+                    origin = f"http://{self.headers.get('Host', '127.0.0.1:3333')}"
+                    if payload.get("email"):
+                        sess.config["email"] = str(payload.get("email")).strip()
+                    info = wizard_manager.launch_login(sess, redirect_origin=origin)
                     self._serve_json({"status": "ok", "login": info, "wizard": sess.to_dict()})
                 elif action == "check-auth":
                     status_info = wizard_manager.check_auth_status(sess)
@@ -3037,6 +3279,167 @@ class MissionControlHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self._apply_security_headers()
             self.end_headers()
+
+    def _serve_html_content(self, content: str, status: int = 200) -> None:
+        raw = content.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self._apply_security_headers()
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _handle_oauth_callback(self) -> None:
+        query = self.path.split("?")[1] if "?" in self.path else ""
+        params = urllib.parse.parse_qs(query)
+        error = params.get("error", [None])[0]
+        if error:
+            error_desc = params.get("error_description", [error])[0]
+            self._serve_html_content(f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Sign-In Failed</title>
+<style>
+body {{ font-family: system-ui, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #0b0f19; color: #f8fafc; }}
+.card {{ text-align: center; padding: 2rem; background: #1e293b; border-radius: 12px; border: 1px solid #ef4444; max-width: 420px; }}
+h1 {{ color: #ef4444; font-size: 1.25rem; }}
+p {{ color: #94a3b8; font-size: 0.875rem; }}
+</style></head>
+<body>
+<div class="card">
+  <h1>Google Sign-In Failed</h1>
+  <p>{html.escape(error_desc)}</p>
+  <p><button onclick="window.close()" style="padding: 8px 16px; background: #334155; color: white; border: none; border-radius: 6px; cursor: pointer;">Close Window</button></p>
+</div>
+</body></html>""", status=400)
+            return
+
+        code = params.get("code", [None])[0]
+        state = params.get("state", [None])[0]
+        if not code or not state:
+            self._serve_html_content("<h1>Missing authorization code or state</h1>", status=400)
+            return
+
+        sess = wizard_manager.get(state)
+        if not sess:
+            self._serve_html_content("<h1>OAuth session not found or expired</h1>", status=404)
+            return
+
+        host = self.headers.get("Host", "127.0.0.1:3333")
+        redirect_uri = f"http://{host}/callback"
+        client_id, client_secret = _get_antigravity_oauth_credentials()
+        token_payload = {
+            "grant_type": "authorization_code",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "code": code,
+            "redirect_uri": redirect_uri,
+        }
+
+        try:
+            tok_req = urllib.request.Request(
+                "https://oauth2.googleapis.com/token",
+                data=urllib.parse.urlencode(token_payload).encode("utf-8"),
+                headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(tok_req, timeout=15) as tok_resp:
+                tokens = json.loads(tok_resp.read().decode("utf-8"))
+        except Exception as exc:
+            self._serve_html_content(f"<h1>Token Exchange Failed</h1><p>{html.escape(str(exc))}</p>", status=502)
+            return
+
+        access_token = tokens.get("access_token", "")
+        refresh_token = tokens.get("refresh_token", "")
+        id_token = tokens.get("id_token", "")
+        primary_token = refresh_token or access_token
+
+        # Fetch user info for account identification
+        user_email = ""
+        if access_token:
+            try:
+                u_req = urllib.request.Request(
+                    "https://www.googleapis.com/oauth2/v1/userinfo",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+                with urllib.request.urlopen(u_req, timeout=10) as u_resp:
+                    u_data = json.loads(u_resp.read().decode("utf-8"))
+                    user_email = u_data.get("email", "")
+            except Exception:
+                pass
+
+        if not user_email and sess.config.get("email"):
+            user_email = sess.config.get("email")
+
+        # Persist into isolated profile directory
+        mgr = AntigravityAuthManager()
+        data_dir, profile_dir = mgr.create_isolated_profile(sess.account_id, sess.config.get("app_data_dir"))
+        token_file = profile_dir / TOKEN_FILENAME
+        token_data_to_store = {
+            "token": primary_token,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "auth_method": "oauth",
+        }
+        if id_token:
+            token_data_to_store["id_token"] = id_token
+        if user_email:
+            token_data_to_store["email"] = user_email
+
+        token_file.write_text(json.dumps(token_data_to_store), encoding="utf-8")
+        try:
+            token_file.chmod(0o600)
+        except OSError:
+            pass
+
+        # Save to CredentialManager
+        cred_ref = f"secret://mission-control/{sess.provider_id}/{sess.account_id}/oauth_token"
+        try:
+            get_credential_manager().store(cred_ref, primary_token)
+        except Exception:
+            pass
+        sess.credential_reference = cred_ref
+
+        if user_email:
+            sess.config["email"] = user_email
+            if sess.account:
+                sess.account.metadata["email"] = user_email
+                sess.account.description = f"Antigravity account ({user_email})"
+
+        # Mark authenticated
+        AccountLifecycleStateMachine.transition(
+            sess.account, AccountLifecycleState.AUTHENTICATED, reason="Google OAuth login successful"
+        )
+        sess.step = "authenticate"
+
+        self._serve_html_content(f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Google Sign-In Successful</title>
+  <style>
+    body {{ font-family: system-ui, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #0b0f19; color: #f8fafc; }}
+    .card {{ text-align: center; padding: 2.5rem; background: #1e293b; border-radius: 12px; border: 1px solid #10b981; max-width: 440px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }}
+    .check {{ font-size: 3rem; color: #10b981; line-height: 1; margin-bottom: 1rem; }}
+    h1 {{ font-size: 1.25rem; margin: 0 0 0.5rem; }}
+    p {{ color: #94a3b8; font-size: 0.875rem; margin: 0 0 1rem; }}
+    .email {{ font-family: monospace; color: #818cf8; font-weight: 600; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="check">✓</div>
+    <h1>Google Sign-In Successful!</h1>
+    <p>Logged in as <span class="email">{html.escape(user_email or 'Google User')}</span>.</p>
+    <p>Your account is authenticated. This window will close automatically.</p>
+  </div>
+  <script>
+    if (window.opener) {{
+      try {{ window.opener.postMessage({{ type: 'google_oauth_complete', wizard_id: '{html.escape(state)}', email: '{html.escape(user_email)}' }}, '*'); }} catch (e) {{}}
+    }}
+    setTimeout(() => {{ window.close(); }}, 1500);
+  </script>
+</body>
+</html>""")
 
     def _serve_html(self) -> None:
         html = """<!DOCTYPE html>
@@ -5917,54 +6320,64 @@ class MissionControlHandler(BaseHTTPRequestHandler):
         }
       } else if (wizState.step === 'configure') {
         const isAntigravity = wizState.provider_id === 'antigravity';
+        const isOAuth = wizState.auth_method === 'oauth';
         const isApiKey = wizState.auth_method === 'api_key';
 
+        let defaultBaseUrl = '';
+        if (wizState.provider_id === 'openai') defaultBaseUrl = 'https://api.openai.com/v1';
+        else if (wizState.provider_id === 'anthropic') defaultBaseUrl = 'https://api.anthropic.com/v1';
+        else if (wizState.provider_id === 'gemini' || wizState.provider_id === 'gemini-api') defaultBaseUrl = 'https://generativelanguage.googleapis.com/v1beta';
+        else if (wizState.provider_id === 'openrouter') defaultBaseUrl = 'https://openrouter.ai/api/v1';
+        else if (wizState.provider_id === 'groq') defaultBaseUrl = 'https://api.groq.com/openai/v1';
+        else if (wizState.provider_id === 'ollama') defaultBaseUrl = 'http://localhost:11434/v1';
+
         let customFields = '';
-        if (isAntigravity) {
+        if (isAntigravity && isOAuth) {
           customFields = `
-            <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-2">Google Account Email *</label>
+            <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-3">Google Account Email (Optional login hint)</label>
             <input id="wiz-email" type="email" placeholder="e.g. user@gmail.com" value="${wizState.email || ''}" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200">
-            <p class="text-[10px] text-slate-500 mt-0.5">Identifies this Antigravity account in the multi-account routing pool.</p>
+            <p class="text-[10px] text-slate-500 mt-0.5">Pre-selects your Google account on the login page.</p>
 
-            ${wizState.auth_method === 'oauth' ? `
-            <div class="mt-3 p-3 bg-slate-950 border border-indigo-900/60 rounded space-y-2">
+            <div class="mt-4 p-4 bg-slate-900 border border-indigo-500/40 rounded-lg space-y-3">
               <div class="flex items-center justify-between">
-                <span class="text-xs font-semibold text-indigo-300">OmniRoute-Style Google OAuth Onboarding</span>
-                <span id="wiz-oauth-status" class="text-[10px] text-slate-400">Ready</span>
+                <div class="flex items-center gap-2">
+                  <svg class="w-5 h-5" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"/></svg>
+                  <span class="text-sm font-semibold text-slate-100">Google Interactive Browser OAuth</span>
+                </div>
+                <span id="wiz-oauth-status" class="text-xs text-indigo-300 bg-indigo-950/60 px-2 py-0.5 rounded border border-indigo-800/60">Ready</span>
               </div>
-              <p class="text-[11px] text-slate-400">Launch Google sign-in to authenticate this account in an isolated profile, or paste your token below.</p>
-              <div class="flex items-center gap-2">
-                <button type="button" onclick="wizLaunchOAuthLogin()" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded shadow flex items-center gap-1.5">
-                  <svg class="w-3.5 h-3.5 fill-current" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14.5v-9l6 4.5-6 4.5z"/></svg>
-                  Launch Google Sign-In
+              <p class="text-xs text-slate-300">Click <b>Sign In with Google</b> (or <b>Next</b>) to authenticate in a popup window. OmniRoute-style PKCE authentication exchanges tokens directly with Google and stores them in an isolated profile directory with 0600 permissions. No manual token copying required.</p>
+              <div class="flex items-center gap-3 pt-1">
+                <button type="button" id="wiz-google-login-btn" onclick="wizLaunchOAuthLogin()" class="px-4 py-2 bg-white hover:bg-slate-100 text-slate-900 text-xs font-semibold rounded shadow-md flex items-center gap-2 transition">
+                  <svg class="w-4 h-4" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"/></svg>
+                  Sign In with Google
                 </button>
-                <button type="button" onclick="wizCheckAuthStatus()" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded border border-slate-700">
-                  Check Token
+                <button type="button" onclick="wizCheckAuthStatus()" class="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded border border-slate-700">
+                  Verify Token
                 </button>
               </div>
-              <div id="wiz-oauth-instructions" class="hidden text-[10px] font-mono text-slate-400 bg-slate-900 p-2 rounded border border-slate-800 break-all"></div>
-
-              <div class="pt-1">
-                <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1">Direct OAuth Token / Session Key (Optional)</label>
-                <input id="wiz-key" type="password" placeholder="Paste session token / key directly if preferred" class="w-full bg-slate-900 border border-slate-800 rounded p-2 text-slate-200 font-mono text-xs">
-              </div>
-            </div>` : `
-            <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-2">Direct OAuth Token / Session Key *</label>
-            <input id="wiz-key" type="password" placeholder="Paste token here..." class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono">
-            <p class="text-[10px] text-emerald-400/80 mt-1">🔒 Stored in isolated profile directory with 0600 permissions.</p>`}
+            </div>
           `;
-        } else if (isApiKey) {
+        } else if (isAntigravity) {
           customFields = `
-            <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-2">Base URL (optional)</label>
-            <input id="wiz-baseurl" placeholder="https://api.openai.com/v1" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono">
-            <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-2">API Key / Secret *</label>
-            <input id="wiz-key" type="password" placeholder="sk-..." class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono">
-            <p class="text-[10px] text-emerald-400/80 mt-1">🔒 Sent once to CredentialManager. Only a secret:// reference is ever stored or shown.</p>
+            <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-3">Google Account Email *</label>
+            <input id="wiz-email" type="email" placeholder="e.g. user@gmail.com" value="${wizState.email || ''}" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200">
+            <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-3">Direct OAuth Token / Session Key (Manual / Headless) *</label>
+            <input id="wiz-key" type="password" placeholder="Paste session token or OAuth JSON token here..." class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono text-xs">
+            <p class="text-[10px] text-emerald-400/80 mt-1">🔒 Stored in isolated profile directory with 0600 permissions. For headless/remote environments without a browser.</p>
+          `;
+        } else if (isApiKey || ['openai', 'anthropic', 'gemini', 'gemini-api', 'openrouter', 'groq', 'ollama', 'cline'].includes(wizState.provider_id)) {
+          customFields = `
+            <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-3">Base URL (optional)</label>
+            <input id="wiz-baseurl" value="${defaultBaseUrl}" placeholder="${defaultBaseUrl || 'https://api.openai.com/v1'}" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono text-xs">
+            <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-3">API Key / Secret ${wizState.provider_id === 'ollama' ? '(optional for local)' : '*'}</label>
+            <input id="wiz-key" type="password" placeholder="${wizState.provider_id === 'anthropic' ? 'sk-ant-...' : (wizState.provider_id.includes('gemini') ? 'AIza...' : 'sk-...')}" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono text-xs">
+            <p class="text-[10px] text-emerald-400/80 mt-1">🔒 Sent once to CredentialManager. Tested with live pre-flight validation in Step 5.</p>
           `;
         } else {
           customFields = `
-            <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-2">Base URL (optional)</label>
-            <input id="wiz-baseurl" placeholder="https://..." class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono">
+            <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-3">Base URL (optional)</label>
+            <input id="wiz-baseurl" placeholder="https://..." class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono text-xs">
             <p class="text-[10px] text-slate-500 mt-2">This provider uses ${wizState.auth_method}. A fresh isolated profile directory will be allocated in the next step.</p>
           `;
         }
@@ -6071,6 +6484,18 @@ class MissionControlHandler(BaseHTTPRequestHandler):
             cfg.api_key = keyEl.value.trim();
             cfg.auth_token = keyEl.value.trim();
           }
+
+          // If Antigravity + OAuth and not authenticated yet, automatically launch Google sign-in
+          if (wizState.provider_id === 'antigravity' && wizState.auth_method === 'oauth') {
+            const chk = await fetchWithAuth('/api/wizard/check-auth?wizard_id=' + encodeURIComponent(wizState.wizard_id));
+            const chkd = await chk.json().catch(() => ({}));
+            if (!chkd.token_exists && !cfg.api_key) {
+              await wizPost('configure', { config: cfg });
+              wizLaunchOAuthLogin();
+              return;
+            }
+          }
+
           const r = await wizPost('configure', { config: cfg });
           if (keyEl) keyEl.value = '';  // never keep the secret in the DOM
           if (!r.ok) { wizShowError(r.d.error || ('HTTP ' + r.status)); return; }
@@ -6147,20 +6572,28 @@ class MissionControlHandler(BaseHTTPRequestHandler):
 
     async function wizLaunchOAuthLogin() {
       const st = document.getElementById('wiz-oauth-status');
-      const ins = document.getElementById('wiz-oauth-instructions');
-      if (st) st.textContent = 'Launching isolated profile session...';
+      if (st) {
+        st.className = 'text-xs text-indigo-300 font-semibold';
+        st.textContent = 'Opening Google Sign-In...';
+      }
       try {
-        const r = await wizPost('launch-login', {});
-        if (r.ok && r.d.login) {
-          const l = r.d.login;
+        const email = document.getElementById('wiz-email')?.value?.trim() || '';
+        const r = await wizPost('launch-login', { email: email });
+        if (r.ok && r.d.login && r.d.login.auth_url) {
+          const authUrl = r.d.login.auth_url;
           if (st) {
-            st.className = 'text-[10px] text-emerald-400 font-semibold';
-            st.textContent = 'Profile ready. Waiting for auth completion...';
+            st.className = 'text-xs text-amber-400 font-semibold';
+            st.textContent = 'Waiting for Google sign-in in popup...';
           }
-          if (ins) {
-            ins.classList.remove('hidden');
-            ins.innerHTML = `<strong>Command:</strong> ${l.command_str || l.command}<br><span class="text-slate-400">${l.instructions || ''}</span>`;
-          }
+          const w = 620, h = 720;
+          const left = Math.max(0, Math.floor((window.screen.width - w) / 2));
+          const top = Math.max(0, Math.floor((window.screen.height - h) / 2));
+          window._oauthPopup = window.open(
+            authUrl,
+            'google_oauth_popup',
+            `width=${w},height=${h},top=${top},left=${left},status=no,resizable=yes`
+          );
+
           if (!window._wizPollInterval) {
             window._wizPollInterval = setInterval(async () => {
               if (!wizState || (wizState.step !== 'configure' && wizState.step !== 'authenticate')) {
@@ -6169,18 +6602,18 @@ class MissionControlHandler(BaseHTTPRequestHandler):
                 return;
               }
               await wizCheckAuthStatus();
-            }, 3000);
+            }, 2500);
           }
         } else {
           if (st) {
-            st.className = 'text-[10px] text-red-400';
-            st.textContent = r.d.error || 'Failed to initiate';
+            st.className = 'text-xs text-red-400 font-semibold';
+            st.textContent = r.d.error || 'Failed to start login flow';
           }
         }
       } catch (e) {
         if (st) {
-          st.className = 'text-[10px] text-red-400';
-          st.textContent = 'Network error: ' + e.message;
+          st.className = 'text-xs text-red-400 font-semibold';
+          st.textContent = 'Error: ' + e.message;
         }
       }
     }
@@ -6194,8 +6627,8 @@ class MissionControlHandler(BaseHTTPRequestHandler):
         const tokenStatusEl = document.getElementById('wiz-auth-token-status');
         if (d.token_exists) {
           if (st) {
-            st.className = 'text-[10px] text-emerald-400 font-bold';
-            st.textContent = '✓ Token Detected';
+            st.className = 'text-xs text-emerald-400 font-bold';
+            st.textContent = '✓ Token Detected & Active';
           }
           if (tokenStatusEl) {
             tokenStatusEl.innerHTML = `<span class="text-slate-500">Status:</span> <span class="text-emerald-400 font-sans font-bold">✓ Token Detected & Active</span>`;
@@ -6204,13 +6637,43 @@ class MissionControlHandler(BaseHTTPRequestHandler):
             clearInterval(window._wizPollInterval);
             window._wizPollInterval = null;
           }
+          if (wizState.step === 'configure') {
+            wizState.step = 'authenticate';
+            wizRenderBody();
+            setTimeout(wizNext, 400);
+          }
         } else {
           if (tokenStatusEl) {
-            tokenStatusEl.innerHTML = `<span class="text-slate-500">Status:</span> <span class="text-amber-400 font-sans">Token file not found yet. Complete login or paste token.</span>`;
+            tokenStatusEl.innerHTML = `<span class="text-slate-500">Status:</span> <span class="text-amber-400 font-sans">Token file not found yet. Complete login in popup.</span>`;
           }
         }
       } catch (e) {}
     }
+
+    window.addEventListener('message', async (event) => {
+      if (event.data && event.data.type === 'google_oauth_complete') {
+        if (window._oauthPopup && !window._oauthPopup.closed) {
+          try { window._oauthPopup.close(); } catch (e) {}
+        }
+        if (window._wizPollInterval) {
+          clearInterval(window._wizPollInterval);
+          window._wizPollInterval = null;
+        }
+        const st = document.getElementById('wiz-oauth-status');
+        if (st) {
+          st.className = 'text-xs text-emerald-400 font-bold';
+          st.textContent = '✓ Google Sign-In Successful (' + (event.data.email || '') + ')';
+        }
+        showToast('Google Sign-In successful for ' + (event.data.email || wizState?.account_id || ''), 'success');
+        if (wizState && wizState.step === 'configure') {
+          wizState.step = 'authenticate';
+          wizRenderBody();
+          setTimeout(wizNext, 400);
+        } else if (wizState && wizState.step === 'authenticate') {
+          setTimeout(wizNext, 400);
+        }
+      }
+    });
 
     async function openLegacyAddAccountModal(preselectedProviderId) {
       const provSel = document.getElementById('acct-modal-provider');

@@ -86,6 +86,9 @@ class APIProviderOnboarder:
         "anthropic": "https://api.anthropic.com/v1",
         "gemini": "https://generativelanguage.googleapis.com/v1beta",
         "gemini-api": "https://generativelanguage.googleapis.com/v1beta",
+        "openrouter": "https://openrouter.ai/api/v1",
+        "groq": "https://api.groq.com/openai/v1",
+        "ollama": "http://localhost:11434/v1",
     }
 
     KNOWN_MODELS: dict[str, list[str]] = {
@@ -105,6 +108,22 @@ class APIProviderOnboarder:
             "gemini-2.0-flash",
             "gemini-1.5-pro",
             "gemini-1.5-flash",
+        ],
+        "openrouter": [
+            "anthropic/claude-3.7-sonnet",
+            "openai/gpt-4o",
+            "deepseek/deepseek-r1",
+            "meta-llama/llama-3.3-70b-instruct",
+        ],
+        "groq": [
+            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant",
+            "mixtral-8x7b-32768",
+        ],
+        "ollama": [
+            "llama3.2",
+            "mistral",
+            "codellama",
         ],
     }
 

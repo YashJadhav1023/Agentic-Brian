@@ -63,6 +63,9 @@ class ClineCapabilities:
         }
 
 
+_GLOBAL_CLINE_CAPS: dict[str, ClineCapabilities] = {}
+
+
 class ClineAuthManager:
     """Manages Cline CLI capability discovery, profile isolation, and authentication."""
 
@@ -91,10 +94,14 @@ class ClineAuthManager:
 
     def discover_capabilities(self, force_refresh: bool = False) -> ClineCapabilities:
         """Dynamically inspect installed cline binary via --version and --help."""
-        if self._capabilities_cache and not force_refresh:
-            return self._capabilities_cache
+        exe = self.resolve_executable() or ""
+        if not force_refresh:
+            if self._capabilities_cache:
+                return self._capabilities_cache
+            if exe in _GLOBAL_CLINE_CAPS:
+                self._capabilities_cache = _GLOBAL_CLINE_CAPS[exe]
+                return self._capabilities_cache
 
-        exe = self.resolve_executable()
         if not exe:
             cap = ClineCapabilities(
                 version="not_installed",
@@ -105,6 +112,7 @@ class ClineAuthManager:
                 executable_path="",
             )
             self._capabilities_cache = cap
+            _GLOBAL_CLINE_CAPS[""] = cap
             return cap
 
         version_str = "unknown"
@@ -164,6 +172,7 @@ class ClineAuthManager:
             executable_path=exe,
         )
         self._capabilities_cache = cap
+        _GLOBAL_CLINE_CAPS[exe] = cap
         return cap
 
     def setup_account_isolation(self, account_id: str) -> tuple[Path, Path]:

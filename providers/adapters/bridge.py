@@ -7,7 +7,13 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from agents.base.adapter import AgentAdapter, Capability, TaskExecutionResult
+from agents.base.adapter import (
+    AgentAdapter,
+    AgentStatus,
+    Capability,
+    ExecutionMode,
+    TaskExecutionResult,
+)
 from brain.orchestrator.job import Job
 from providers.base import AIProvider, ProviderType
 from providers.registry.model_registry import ModelMetadata
@@ -98,3 +104,78 @@ class AgentProviderBridge(AIProvider):
         if hasattr(self.adapter, "binary") and getattr(self.adapter, "binary") is None:
             return False, [f"Binary not resolved for {self.adapter.agent_id}"]
         return True, []
+
+
+class AIProviderAgentAdapter(AgentAdapter):
+    """Wraps an AIProvider to satisfy the AgentAdapter contract.
+
+    Enables direct API providers (OpenAI, Anthropic, Gemini, Groq, OpenRouter)
+    to operate as first-class routable workers within the Smart Router.
+    """
+
+    def __init__(
+        self,
+        ai_provider: AIProvider,
+        agent_id: str,
+        account_id: str,
+        capabilities: frozenset[Capability] | None = None,
+        models: tuple[str, ...] | None = None,
+        default_model: str = "auto",
+    ) -> None:
+        self._ai_provider = ai_provider
+        self._agent_id = agent_id
+        self._account_id = account_id
+        self._capabilities = capabilities or ai_provider.capabilities()
+        self._models = models or tuple(m.model_id for m in ai_provider.list_models())
+        self._default_model = default_model or (self._models[0] if self._models else "auto")
+        self._current_status = AgentStatus.IDLE
+
+    @property
+    def agent_id(self) -> str:
+        return self._agent_id
+
+    @property
+    def provider(self) -> str:
+        return self._ai_provider.provider_id
+
+    @property
+    def account_id(self) -> str:
+        return self._account_id
+
+    @property
+    def execution_mode(self) -> ExecutionMode:
+        return ExecutionMode.API
+
+    def capabilities(self) -> frozenset[Capability]:
+        return self._capabilities
+
+    def available_models(self) -> tuple[str, ...]:
+        return self._models
+
+    def status(self, task_id: str | None = None) -> AgentStatus:
+        return self._current_status
+
+    def health(self) -> tuple[bool, str]:
+        return self._ai_provider.health()
+
+    def execute(
+        self,
+        task_id: str,
+        prompt: str,
+        model: str | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> TaskExecutionResult:
+        self._current_status = AgentStatus.WORKING
+        try:
+            job = Job(
+                id=task_id,
+                task=prompt,
+                model=model or self._default_model,
+                metadata={"options": options or {}},
+            )
+            return self._ai_provider.execute(job)
+        finally:
+            self._current_status = AgentStatus.IDLE
+
+    def validate_config(self) -> tuple[bool, list[str]]:
+        return self._ai_provider.validate_config()
