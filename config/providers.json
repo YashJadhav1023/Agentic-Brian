@@ -187,11 +187,25 @@
       "models_verified_with": "Verified live from ~/.cline/data/settings/providers.json and CLI execution",
       "model_capabilities": [
         {
+          "id": "anthropic/claude-fable-5.1",
+          "name": "Claude Fable 5.1 (Anthropic)",
+          "availability": "configured",
+          "billing": "standard",
+          "reason": "Active configured model in Cline account 1 and account 2"
+        },
+        {
           "id": "deepseek/deepseek-v4-flash",
           "name": "DeepSeek V4 Flash",
           "availability": "free",
           "billing": "free",
           "reason": "Cline OAuth free usage billing ($0.00 cost)"
+        },
+        {
+          "id": "z-ai/glm-5.3-flash",
+          "name": "GLM 5.3 Flash",
+          "availability": "active",
+          "billing": "standard",
+          "reason": "Active primary model in system profile"
         },
         {
           "id": "auto",
@@ -215,10 +229,11 @@
             "code-review"
           ],
           "models": [
+            "anthropic/claude-fable-5.1",
             "deepseek/deepseek-v4-flash",
             "auto"
           ],
-          "default_model": "deepseek/deepseek-v4-flash"
+          "default_model": "anthropic/claude-fable-5.1"
         },
         "cline-account-2": {
           "agent_id": "cline-account-2",
@@ -233,10 +248,11 @@
             "code-review"
           ],
           "models": [
+            "anthropic/claude-fable-5.1",
             "deepseek/deepseek-v4-flash",
             "auto"
           ],
-          "default_model": "deepseek/deepseek-v4-flash"
+          "default_model": "anthropic/claude-fable-5.1"
         },
         "cline-account-3": {
           "agent_id": "cline-account-3",

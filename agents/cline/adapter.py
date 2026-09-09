@@ -90,11 +90,25 @@ class ClineAdapter(AgentAdapter):
         return self._capabilities
 
     def available_models(self) -> tuple[str, ...]:
-        return self._models
+        models = list(self._models)
+        if self._data_dir:
+            prov_file = self._data_dir / "settings" / "providers.json"
+            if prov_file.is_file():
+                try:
+                    import json
+                    d = json.loads(prov_file.read_text(encoding="utf-8"))
+                    for pdata in d.get("providers", {}).values():
+                        setts = pdata.get("settings", {})
+                        m = setts.get("model")
+                        if m and m not in models:
+                            models.insert(0, m)
+                except Exception:
+                    pass
+        return tuple(models)
 
     @property
     def models(self) -> tuple[str, ...]:
-        return self._models
+        return self.available_models()
 
     def status(self, task_id: str | None = None) -> AgentStatus:
         return self._current_status

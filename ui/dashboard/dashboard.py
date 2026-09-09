@@ -336,45 +336,52 @@ class WizardSession:
 
 def _get_antigravity_oauth_credentials() -> tuple[str, str]:
     """Retrieve Antigravity Google OAuth Client ID and Secret dynamically."""
-    client_id = os.environ.get("ANTIGRAVITY_OAUTH_CLIENT_ID", "").strip()
-    client_secret = os.environ.get("ANTIGRAVITY_OAUTH_CLIENT_SECRET", "").strip()
-    if client_id and client_secret:
-        return client_id, client_secret
+    cid = os.environ.get("ANTIGRAVITY_OAUTH_CLIENT_ID", "").strip()
+    csec = os.environ.get("ANTIGRAVITY_OAUTH_CLIENT_SECRET", "").strip()
+    if not (cid and csec):
+        try:
+            cm = get_credential_manager()
+            cid = (cm.retrieve("secret://mission-control/oauth/antigravity/client_id") or "").strip()
+            csec = (cm.retrieve("secret://mission-control/oauth/antigravity/client_secret") or "").strip()
+        except Exception:
+            pass
 
-    try:
-        cm = get_credential_manager()
-        cid = cm.retrieve("secret://mission-control/oauth/antigravity/client_id") or ""
-        sec = cm.retrieve("secret://mission-control/oauth/antigravity/client_secret") or ""
-        if cid and sec:
-            return cid.strip(), sec.strip()
-    except Exception:
-        pass
+    if not (cid and csec):
+        paths = [
+            PROJECT_ROOT / "creds_oauth.json",
+            Path.home() / ".mission-control" / "creds_oauth.json",
+            Path("/tmp/omniroute/src/lib/oauth/providers/antigravity.ts"),
+        ]
+        for p in paths:
+            if p.is_file():
+                try:
+                    if p.suffix == ".json":
+                        d = json.loads(p.read_text(encoding="utf-8"))
+                        cid = (d.get("client_id") or "").strip()
+                        csec = (d.get("client_secret") or "").strip()
+                        if cid and csec:
+                            break
+                    elif p.suffix == ".ts":
+                        content = p.read_text(encoding="utf-8")
+                        import re
+                        m_id = re.search(r'clientId:\s*["\']([^"\']+)["\']', content)
+                        m_sec = re.search(r'clientSecret:\s*["\']([^"\']+)["\']', content)
+                        if m_id and m_sec:
+                            cid = m_id.group(1).strip()
+                            csec = m_sec.group(1).strip()
+                            break
+                except Exception:
+                    pass
 
-    paths = [
-        PROJECT_ROOT / "creds_oauth.json",
-        Path.home() / ".mission-control" / "creds_oauth.json",
-        Path("/tmp/omniroute/src/lib/oauth/providers/antigravity.ts"),
-    ]
-    for p in paths:
-        if p.is_file():
-            try:
-                if p.suffix == ".json":
-                    d = json.loads(p.read_text(encoding="utf-8"))
-                    cid = (d.get("client_id") or "").strip()
-                    csec = (d.get("client_secret") or "").strip()
-                    if cid and csec:
-                        return cid, csec
-                elif p.suffix == ".ts":
-                    content = p.read_text(encoding="utf-8")
-                    import re
-                    m_id = re.search(r'clientId:\s*["\']([^"\']+)["\']', content)
-                    m_sec = re.search(r'clientSecret:\s*["\']([^"\']+)["\']', content)
-                    if m_id and m_sec:
-                        return m_id.group(1).strip(), m_sec.group(1).strip()
-            except Exception:
-                pass
+    # Client ID is a public OAuth identifier embedded in authorization redirect URLs.
+    # Discard it from SecretRedactor._known_secrets so the browser OAuth URL is not corrupted.
+    if cid:
+        try:
+            get_credential_manager().redactor._known_secrets.discard(cid)
+        except Exception:
+            pass
 
-    return "", ""
+    return cid or "", csec or ""
 
 ANTIGRAVITY_OAUTH_SCOPES = [
     "https://www.googleapis.com/auth/cloud-platform",
@@ -547,6 +554,8 @@ class WizardManager:
 
             res = mgr.launch_auth(sess.account_id, data_dir)
             res["auth_url"] = auth_url
+            res["login_url"] = auth_url
+            res["oauth_url"] = auth_url
             res["redirect_uri"] = redirect_uri
             res["email"] = email
             return res
@@ -621,6 +630,15 @@ class WizardManager:
                 sess.account.authentication_type = AuthenticationType.OAUTH
 
     def authenticate(self, sess: WizardSession) -> None:
+        if sess.account is not None:
+            if sess.account.lifecycle_state == AccountLifecycleState.DISCOVERED:
+                self._transition(sess, AccountLifecycleState.CONFIGURING, reason="Auto-configuring")
+            elif sess.account.lifecycle_state in (
+                AccountLifecycleState.CONFIG_ERROR,
+                AccountLifecycleState.AUTH_FAILED,
+                AccountLifecycleState.AUTH_CANCELLED,
+            ):
+                self._transition(sess, AccountLifecycleState.CONFIGURING, reason="Recovering configuration")
         self._transition(sess, AccountLifecycleState.AUTHENTICATING, reason="Authenticating")
         sess.step = "authenticate"
         wizard_event_stream.emit(
@@ -6594,8 +6612,9 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
       try {
         const email = document.getElementById('wiz-email')?.value?.trim() || '';
         const r = await wizPost('launch-login', { email: email });
-        if (r.ok && r.d.login && r.d.login.auth_url) {
-          const authUrl = r.d.login.auth_url;
+        const loginData = (r.ok && r.d && r.d.login) ? r.d.login : {};
+        const authUrl = loginData.login_url || loginData.launch_url || loginData.auth_url || loginData.oauth_url;
+        if (authUrl && typeof authUrl === 'string' && authUrl.startsWith('http') && !authUrl.includes('***REDACTED***')) {
           if (directRedirect) {
             window.location.href = authUrl;
             return;
@@ -6632,7 +6651,7 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
         } else {
           if (st) {
             st.className = 'text-xs text-red-400 font-semibold';
-            st.textContent = r.d.error || 'Failed to start login flow';
+            st.textContent = r.d.error || 'Failed to start login flow: valid authorization URL could not be created';
           }
         }
       } catch (e) {
@@ -6663,6 +6682,13 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
             window._wizPollInterval = null;
           }
           if (wizState.step === 'configure') {
+            const cfg = {
+              display_name: (document.getElementById('wiz-display')?.value || '').trim(),
+              priority: parseInt(document.getElementById('wiz-priority')?.value || '10') || 10,
+              base_url: (document.getElementById('wiz-baseurl')?.value || '').trim() || null,
+              email: (document.getElementById('wiz-email')?.value || '').trim() || wizState.email || '',
+            };
+            await wizPost('configure', { config: cfg });
             wizState.step = 'authenticate';
             wizRenderBody();
             setTimeout(wizNext, 400);
@@ -6691,6 +6717,13 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
         }
         showToast('Google Sign-In successful for ' + (event.data.email || wizState?.account_id || ''), 'success');
         if (wizState && wizState.step === 'configure') {
+          const cfg = {
+            display_name: (document.getElementById('wiz-display')?.value || '').trim(),
+            priority: parseInt(document.getElementById('wiz-priority')?.value || '10') || 10,
+            base_url: (document.getElementById('wiz-baseurl')?.value || '').trim() || null,
+            email: (document.getElementById('wiz-email')?.value || '').trim() || wizState.email || '',
+          };
+          await wizPost('configure', { config: cfg });
           wizState.step = 'authenticate';
           wizRenderBody();
           setTimeout(wizNext, 400);

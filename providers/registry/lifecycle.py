@@ -97,6 +97,7 @@ VALID_TRANSITIONS: dict[AccountLifecycleState, set[AccountLifecycleState]] = {
     AccountLifecycleState.DISCOVERED: {
         AccountLifecycleState.DISCOVERED,
         AccountLifecycleState.CONFIGURING,
+        AccountLifecycleState.AUTHENTICATING,
         AccountLifecycleState.DISABLED,
     },
     AccountLifecycleState.CONFIGURING: {
