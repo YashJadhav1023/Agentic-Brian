@@ -107,11 +107,13 @@ class _WizardDemoTestCase(unittest.TestCase):
             except json.JSONDecodeError:
                 return exc.code, {"raw": raw}
 
-    def _get(self, path: str):
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{self.port}{path}", timeout=30
-        ) as resp:
+    def _get(self, path: str, authed: bool = True):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}")
+        if authed:
+            req.add_header("Authorization", f"Bearer {self.token}")
+        with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode("utf-8"))
+
 
     # ---- flow helpers ----------------------------------------------------
 

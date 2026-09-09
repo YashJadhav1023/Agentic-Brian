@@ -192,6 +192,68 @@ class TestAntigravityWizardEndpoints(unittest.TestCase):
         del_res = self._delete(f"/api/accounts/{test_act_id}")
         self.assertEqual(del_res.get("status"), "removed")
 
+    def test_next_account_id_endpoint_returns_safe_identifier(self):
+        res = self._get("/api/wizard/next-account-id?provider=cline")
+        self.assertIn("next_account_id", res)
+        self.assertTrue(res["next_account_id"].startswith("cline-"))
+
+        res_kiro = self._get("/api/wizard/next-account-id?provider=kiro")
+        self.assertIn("next_account_id", res_kiro)
+        self.assertTrue(res_kiro["next_account_id"].startswith("kiro-"))
+
+    def test_wizard_start_sanitizes_account_id_with_spaces_and_symbols(self):
+        # User enters "Cline -4" or similar
+        start_res = self._post("/api/wizard/start", {
+            "provider_id": "cline",
+            "account_id": "Cline -4",
+        })
+        self.assertEqual(start_res["status"], "started")
+        wizard = start_res["wizard"]
+        self.assertEqual(wizard["account_id"], "cline-4")
+        # Clean up session
+        self._post("/api/wizard/cancel", {"wizard_id": wizard["wizard_id"]})
+
+    def test_cline_zero_key_onboarding_without_api_key(self):
+        start_res = self._post("/api/wizard/start", {
+            "provider_id": "cline",
+            "account_id": "test-cline-zero-key-unit",
+        })
+        wiz_id = start_res["wizard"]["wizard_id"]
+        # Select local_session auth
+        self._post("/api/wizard/select-auth", {"wizard_id": wiz_id, "auth_method": "local_session"})
+        # Configure without any api_key
+        cfg_res = self._post("/api/wizard/configure", {"wizard_id": wiz_id, "config": {}})
+        self.assertEqual(cfg_res["wizard"]["step"], "configure")
+        # Authenticate must succeed zero-key without throwing auth rejected
+        auth_res = self._post("/api/wizard/authenticate", {"wizard_id": wiz_id})
+        self.assertEqual(auth_res["wizard"]["step"], "authenticate")
+        # Validate (live=False)
+        val_res = self._post("/api/wizard/validate", {"wizard_id": wiz_id, "live": False})
+        self.assertEqual(val_res["wizard"]["step"], "validate")
+        # Cancel and rollback
+        self._post("/api/wizard/cancel", {"wizard_id": wiz_id})
+
+    def test_kiro_zero_key_onboarding_without_api_key(self):
+        start_res = self._post("/api/wizard/start", {
+            "provider_id": "kiro",
+            "account_id": "test-kiro-zero-key-unit",
+        })
+        wiz_id = start_res["wizard"]["wizard_id"]
+        # Select local_session auth
+        self._post("/api/wizard/select-auth", {"wizard_id": wiz_id, "auth_method": "local_session"})
+        # Configure without any api_key
+        cfg_res = self._post("/api/wizard/configure", {"wizard_id": wiz_id, "config": {}})
+        self.assertEqual(cfg_res["wizard"]["step"], "configure")
+        # Authenticate must succeed zero-key
+        auth_res = self._post("/api/wizard/authenticate", {"wizard_id": wiz_id})
+        self.assertEqual(auth_res["wizard"]["step"], "authenticate")
+        # Validate (live=False)
+        val_res = self._post("/api/wizard/validate", {"wizard_id": wiz_id, "live": False})
+        self.assertEqual(val_res["wizard"]["step"], "validate")
+        # Cancel and rollback
+        self._post("/api/wizard/cancel", {"wizard_id": wiz_id})
+
 
 if __name__ == "__main__":
     unittest.main()
+

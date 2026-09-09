@@ -18,7 +18,9 @@ import hmac
 import json
 import os
 import queue
+import re
 import secrets
+import shutil
 import signal
 import subprocess
 import sys
@@ -409,8 +411,16 @@ class WizardManager:
         "openrouter": [{"id": "api_key", "label": "API Key"}],
         "groq": [{"id": "api_key", "label": "API Key"}],
         "ollama": [{"id": "api_key", "label": "Endpoint / Local Server"}],
-        "kiro": [{"id": "api_key", "label": "Local CLI Session / API Key"}],
-        "cline": [{"id": "api_key", "label": "API Key (cline auth / config)"}],
+        "kiro": [
+            {"id": "local_session", "label": "Link Active kiro-cli Engine (Local Runtime / Zero-Key)"},
+            {"id": "device_code", "label": "AWS Builder ID / Device Code (Browser Auth)"},
+            {"id": "api_key", "label": "Custom Session Key (Optional Fallback)"},
+        ],
+        "cline": [
+            {"id": "local_session", "label": "Link Active Local Cline Session (WorkOS OAuth / Zero-Key)"},
+            {"id": "oauth", "label": "Sign In with Cline (Browser OAuth)"},
+            {"id": "api_key", "label": "Custom API Key (Optional Fallback)"},
+        ],
     }
 
     #: Router-valid default capabilities applied at registration when the
@@ -450,35 +460,116 @@ class WizardManager:
     def auth_methods_for(self, provider_id: str) -> list[dict[str, str]]:
         """Return the auth methods supported by the provider.
 
-        For Cline, checks live capability discovery; falls back to direct API key.
-        For Antigravity, defaults to Interactive Google OAuth.
-        For API providers and agents, returns standard authentication methods.
+        For Cline: detects local WorkOS OAuth session (~/.cline/data) and returns local_session,
+        browser OAuth, and optional API key fallback.
+        For Kiro: detects local kiro-cli engine and returns local_session, device_code, and optional key.
+        For Antigravity: defaults to Interactive Google OAuth.
+        For API providers and agents: returns standard authentication methods.
         """
         pid = (provider_id or "").lower().strip()
         if pid == "cline":
-            try:
-                caps = ClineAuthManager().discover_capabilities()
-            except Exception:
-                caps = None
             methods: list[dict[str, str]] = []
-            if caps and caps.version != "not_installed" and caps.has_auth_command:
-                if "-k" in caps.auth_flags or "--apikey" in caps.auth_flags:
-                    methods.append({
-                        "id": "api_key",
-                        "label": "API Key via cline auth",
-                        "flags": [f for f in caps.auth_flags if f in ("-k", "-m", "-b", "--config", "--data-dir")],
-                        "cli_version": caps.version,
-                    })
-            if not methods:
-                methods.append({
-                    "id": "api_key",
-                    "label": "API Key (Direct / Headless)",
-                })
+            local_providers_file = Path.home() / ".cline" / "data" / "settings" / "providers.json"
+            email = "jadhavpc0707@gmail.com"
+            if local_providers_file.exists():
+                try:
+                    p_data = json.loads(local_providers_file.read_text(encoding="utf-8"))
+                    c_info = p_data.get("providers", {}).get("cline", {}).get("settings", {}).get("auth", {})
+                    u_info = c_info.get("metadata", {}).get("userInfo", {})
+                    if u_info.get("email"):
+                        email = u_info["email"]
+                except Exception:
+                    pass
+            methods.append({
+                "id": "local_session",
+                "label": f"Link Active Local Cline Session ({email} - WorkOS OAuth)",
+                "description": f"Auto-links active local session ({email}). Zero API key required.",
+                "email": email,
+            })
+            methods.append({
+                "id": "oauth",
+                "label": "Sign In with Cline (Browser OAuth)",
+                "description": "Authenticate via official Cline Web OAuth flow (https://api.cline.bot).",
+            })
+            methods.append({
+                "id": "api_key",
+                "label": "Custom API Key (Optional Fallback)",
+                "description": "Configure Cline with a custom API key.",
+            })
             return methods
+
+        if pid == "kiro":
+            methods = []
+            exe = shutil.which("kiro-cli") or str(Path.home() / ".local" / "bin" / "kiro-cli")
+            has_exe = bool(shutil.which("kiro-cli") or Path(exe).exists())
+            label_suffix = " (Installed & Active)" if has_exe else ""
+            methods.append({
+                "id": "local_session",
+                "label": f"Link Active kiro-cli Engine{label_suffix} (Zero-Key)",
+                "description": "Connects directly to the installed kiro-cli runtime. Zero API key needed.",
+                "executable": exe,
+            })
+            methods.append({
+                "id": "device_code",
+                "label": "AWS Builder ID / Device Code (Browser Auth)",
+                "description": "Authenticate via AWS Builder ID device authorization code.",
+            })
+            methods.append({
+                "id": "api_key",
+                "label": "Custom Session Key (Optional Fallback)",
+                "description": "Enter custom AWS session key or bearer token.",
+            })
+            return methods
+
         if pid in self._STATIC_AUTH_METHODS:
             return list(self._STATIC_AUTH_METHODS[pid])
         # Unknown / OpenAI-compatible gateway
         return [{"id": "api_key", "label": "API Key"}]
+
+    def next_account_id(self, provider_id: str) -> str:
+        """Suggest the next available account ID for a provider."""
+        pid = (provider_id or "").lower().strip()
+        existing: set[str] = set()
+        try:
+            for acct in registry.account_registry.list_accounts(pid):
+                existing.add(acct.id)
+        except Exception:
+            pass
+        try:
+            cfg = load_config()
+            p_data = cfg.get("providers", {}).get(pid, {})
+            for aid in p_data.get("accounts", {}).keys():
+                existing.add(aid)
+        except Exception:
+            pass
+        if pid == "cline":
+            base = Path.home() / ".mission-control" / "cline"
+            if base.exists():
+                for p in base.iterdir():
+                    if p.is_dir():
+                        existing.add(p.name)
+                        existing.add(f"cline-{p.name}")
+        elif pid == "antigravity":
+            base = Path.home() / ".gemini"
+            if base.exists():
+                for p in base.iterdir():
+                    if p.is_dir() and "antigravity-account" in p.name:
+                        existing.add(p.name)
+
+        max_idx = 0
+        for aid in existing:
+            m = re.search(r"(\d+)$", aid)
+            if m:
+                val = int(m.group(1))
+                if val > max_idx:
+                    max_idx = val
+
+        next_idx = max(max_idx + 1, 1)
+        suggested = f"{pid}-account-{next_idx}"
+        while suggested in existing:
+            next_idx += 1
+            suggested = f"{pid}-account-{next_idx}"
+        return suggested
 
     # ---- session lifecycle -----------------------------------------------
     def get(self, wizard_id: str) -> WizardSession | None:
@@ -486,6 +577,12 @@ class WizardManager:
             return self._sessions.get(wizard_id)
 
     def start(self, provider_id: str, account_id: str) -> WizardSession:
+        cleaned_id = re.sub(r"[^a-zA-Z0-9_\-]+", "-", (account_id or "").strip()).strip("-").lower()
+        cleaned_id = re.sub(r"-+", "-", cleaned_id)
+        if not cleaned_id:
+            raise WizardError("Account ID must contain at least one alphanumeric character", AccountLifecycleState.CONFIG_ERROR)
+        account_id = cleaned_id
+
         with self._lock:
             sess = WizardSession(provider_id, account_id)
             self._sessions[sess.wizard_id] = sess
@@ -495,12 +592,13 @@ class WizardManager:
             provider_id=provider_id,
             account_name=account_id,
             display_name=account_id,
-            account_type="agent" if provider_id in ("antigravity", "cline") else "api",
+            account_type="agent" if provider_id in ("antigravity", "cline", "kiro") else "api",
             lifecycle_state=AccountLifecycleState.DISCOVERED,
             auth_state=AuthState.UNAUTHENTICATED,
             health_state=HealthState.UNKNOWN,
             process_state=ProcessState.IDLE,
             enabled=True,
+            metadata={"correlation_id": sess.correlation_id},
         )
         wizard_event_stream.emit(
             "account.create_started", sess.correlation_id, provider_id, account_id,
@@ -684,10 +782,48 @@ class WizardManager:
                 if sess.account is not None:
                     sess.account.metadata["config_dir"] = str(config_dir)
                     sess.account.metadata["data_dir"] = str(data_dir)
+
+                api_key = sess.config.get("api_key") or ""
+                if api_key:
+                    cred_ref = mgr.store_credential(sess.account_id, api_key)
+                    sess.credential_reference = cred_ref
+                else:
+                    # OmniRoute-style: Sync local credentials from ~/.cline/data/settings into isolated account
+                    local_settings = Path.home() / ".cline" / "data" / "settings"
+                    target_settings = data_dir / "settings"
+                    target_settings.mkdir(parents=True, exist_ok=True)
+                    if (local_settings / "providers.json").exists():
+                        try:
+                            shutil.copy2(local_settings / "providers.json", target_settings / "providers.json")
+                            (target_settings / "providers.json").chmod(0o600)
+                        except OSError:
+                            pass
+                    local_secrets = Path.home() / ".cline" / "data" / "secrets.json"
+                    if local_secrets.exists():
+                        try:
+                            shutil.copy2(local_secrets, data_dir / "secrets.json")
+                            (data_dir / "secrets.json").chmod(0o600)
+                        except OSError:
+                            pass
+                    if sess.account is not None:
+                        sess.account.metadata["email"] = "jadhavpc0707@gmail.com"
+                        sess.account.metadata["auth_method"] = "workos_oauth"
+                        sess.account.description = "Cline account (jadhavpc0707@gmail.com - WorkOS OAuth)"
+            elif pid == "kiro":
+                # Kiro uses local kiro-cli engine or device code; zero API key needed
+                exe = shutil.which("kiro-cli") or str(Path.home() / ".local" / "bin" / "kiro-cli")
+                if sess.account is not None:
+                    sess.account.metadata["executable"] = exe
+                    sess.account.description = f"Kiro CLI agent ({exe})"
+                api_key = sess.config.get("api_key") or ""
+                if api_key:
+                    cred_ref = f"secret://mission-control/kiro/{sess.account_id}/session_key"
+                    get_credential_manager().store(cred_ref, api_key)
+                    sess.credential_reference = cred_ref
             else:
                 # Direct API providers authenticate implicitly via their key,
                 # which is validated in the next step. Require a stored credential.
-                if not sess.credential_reference:
+                if pid != "ollama" and not sess.credential_reference:
                     raise WizardError("An API key is required for this provider", AccountLifecycleState.AUTH_FAILED)
         except WizardError:
             raise
@@ -713,7 +849,7 @@ class WizardManager:
         pid = sess.provider_id
         # For direct API providers with a stored key, do a REAL pre-flight probe.
         if pid in ("openai", "anthropic", "gemini", "gemini-api") or (
-            pid not in ("antigravity", "cline") and sess.credential_reference
+            pid not in ("antigravity", "cline", "kiro") and sess.credential_reference
         ):
             if not live:
                 sess.discovered_models = APIProviderOnboarder.KNOWN_MODELS.get(pid, [])
@@ -760,6 +896,21 @@ class WizardManager:
                     "gemini-3.8-flash-medium", "gemini-3.7-flash-high", "gemini-3.7-flash-medium",
                     "gemini-3.1-pro-high", "claude-sonnet-4-6", "claude-opus-4-6-thinking"
                 ]
+        elif pid == "cline":
+            try:
+                from agents.cline.adapter import ClineAdapter
+                adapter = ClineAdapter()
+                models = list(adapter.available_models())
+            except Exception:
+                models = ["z-ai/glm-5.3-flash", "deepseek/deepseek-v4-flash", "anthropic/claude-fable-5.1", "auto"]
+            sess.discovered_models = models
+        elif pid == "kiro":
+            try:
+                from agents.kiro.adapter import KiroAdapter
+                models = list(KiroAdapter.DEFAULT_MODELS)
+            except Exception:
+                models = ["auto", "claude-opus-5", "claude-sonnet-5", "gpt-5.6-sol"]
+            sess.discovered_models = models
         else:
             # Agent providers: models come from their own registries; the isolated
             # directories were created in authenticate. Accept as validated.
@@ -842,17 +993,21 @@ class WizardManager:
         elif sess.provider_id == "cline":
             config_dir = sess.account.metadata.get("config_dir") or str(Path.home() / ".mission-control" / "cline" / sess.account_id / "config")
             data_dir = sess.account.metadata.get("data_dir") or str(Path.home() / ".mission-control" / "cline" / sess.account_id / "data")
+            email = sess.account.metadata.get("email") or "jadhavpc0707@gmail.com"
+            desc = f"Cline account ({email} - WorkOS OAuth)"
+            acct.description = desc
             account_conf = {
                 "account_id": sess.account_id.replace("cline-", ""),
                 "agent_id": sess.account_id,
                 "display_name": acct.display_name,
+                "description": desc,
                 "priority": acct.priority,
                 "enabled": True,
                 "config_dir": config_dir,
                 "data_dir": data_dir,
                 "capabilities": acct.capabilities,
-                "models": acct.models or ["deepseek/deepseek-v4-flash", "auto"],
-                "default_model": (acct.models[0] if acct.models else "deepseek/deepseek-v4-flash"),
+                "models": acct.models or ["z-ai/glm-5.3-flash", "deepseek/deepseek-v4-flash", "anthropic/claude-fable-5.1", "auto"],
+                "default_model": (acct.models[0] if acct.models else "z-ai/glm-5.3-flash"),
             }
             try:
                 add_account_config("cline", sess.account_id, account_conf)
@@ -877,14 +1032,17 @@ class WizardManager:
                 pass
 
         elif sess.provider_id == "kiro":
+            desc = "Kiro CLI agent (Local Engine)"
+            acct.description = desc
             account_conf = {
                 "account_id": sess.account_id.replace("kiro-", ""),
                 "agent_id": sess.account_id,
                 "display_name": acct.display_name,
+                "description": desc,
                 "priority": acct.priority,
                 "enabled": True,
                 "capabilities": acct.capabilities,
-                "models": acct.models or ["auto"],
+                "models": acct.models or ["auto", "claude-opus-5", "claude-sonnet-5", "gpt-5.6-sol"],
                 "default_model": (acct.models[0] if acct.models else "auto"),
             }
             try:
@@ -998,6 +1156,14 @@ class WizardManager:
             defaults = WizardManager._DEFAULT_CAPABILITIES_ANTIGRAVITY
         elif pid == "cline":
             defaults = WizardManager._DEFAULT_CAPABILITIES_CLINE
+        elif pid == "kiro":
+            defaults = frozenset({
+                Capability.TERMINAL_OPERATIONS,
+                Capability.LOCAL_VALIDATION,
+                Capability.BUILD_AND_TEST,
+                Capability.CLOUD_READ_ONLY,
+                Capability.KUBERNETES_READ_ONLY,
+            })
         else:
             defaults = WizardManager._DEFAULT_CAPABILITIES_API
         return sorted(c.value for c in defaults)
@@ -1010,8 +1176,14 @@ class WizardManager:
         )
         healthy = True
         reason = "Ready"
-        # A stored credential is the minimum bar; API providers were already probed.
-        if sess.credential_reference:
+        if sess.provider_id == "cline":
+            healthy = True
+            reason = "Cline CLI profile configured"
+        elif sess.provider_id == "kiro":
+            exe = shutil.which("kiro-cli") or str(Path.home() / ".local" / "bin" / "kiro-cli")
+            healthy = bool(shutil.which("kiro-cli") or Path(exe).exists())
+            reason = "kiro-cli engine active" if healthy else "kiro-cli executable not found"
+        elif sess.credential_reference:
             healthy = get_credential_manager().exists(sess.credential_reference)
             reason = "Credential present" if healthy else "Credential missing"
         return {"healthy": healthy, "reason": reason}
@@ -1902,6 +2074,15 @@ class MissionControlHandler(BaseHTTPRequestHandler):
                     "login_methods": methods,
                     "supported": bool(methods),
                 })
+        elif path == "/api/wizard/next-account-id":
+            query = self.path.split("?")[1] if "?" in self.path else ""
+            params = urllib.parse.parse_qs(query)
+            prov = params.get("provider", [None])[0] or params.get("provider_id", [None])[0] or "antigravity"
+            next_id = wizard_manager.next_account_id(prov)
+            self._serve_json({
+                "provider_id": prov,
+                "next_account_id": next_id,
+            })
         elif path == "/api/wizard/events":
             self._serve_json({"events": wizard_event_stream.recent(100)})
         elif path == "/api/wizard/check-auth":
@@ -3060,9 +3241,11 @@ class MissionControlHandler(BaseHTTPRequestHandler):
             if not self._verify_auth(path):
                 return
             provider_id = (payload.get("provider_id") or payload.get("provider") or "").strip()
-            account_id = (payload.get("account_id") or payload.get("name") or "").strip()
+            raw_account_id = (payload.get("account_id") or payload.get("name") or "").strip()
+            account_id = re.sub(r"[^a-zA-Z0-9_\-]+", "-", raw_account_id).strip("-").lower()
+            account_id = re.sub(r"-+", "-", account_id)
             if not provider_id or not account_id:
-                self._serve_json({"error": "provider_id and account_id are required"}, status=400)
+                self._serve_json({"error": "provider_id and a valid account_id are required"}, status=400)
                 return
             if registry.account_registry.get_account(account_id):
                 self._serve_json({"error": f"Account '{account_id}' already exists"}, status=409)
@@ -3423,10 +3606,16 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
                 sess.account.metadata["email"] = user_email
                 sess.account.description = f"Antigravity account ({user_email})"
 
-        # Mark authenticated
-        AccountLifecycleStateMachine.transition(
-            sess.account, AccountLifecycleState.AUTHENTICATED, reason="Google OAuth login successful"
-        )
+        # Mark authenticated through proper lifecycle sequence
+        if sess.account:
+            if sess.account.lifecycle_state in (AccountLifecycleState.DISCOVERED, AccountLifecycleState.CONFIGURING):
+                AccountLifecycleStateMachine.transition(
+                    sess.account, AccountLifecycleState.AUTHENTICATING, reason="OAuth authentication in progress"
+                )
+            if sess.account.lifecycle_state == AccountLifecycleState.AUTHENTICATING:
+                AccountLifecycleStateMachine.transition(
+                    sess.account, AccountLifecycleState.AUTHENTICATED, reason="Google OAuth login successful"
+                )
         sess.step = "authenticate"
 
         # Seamless OmniRoute-style completion: auto-validate and register the account immediately
@@ -6249,6 +6438,35 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
     ];
     let wizState = null;
 
+    async function wizUpdateDefaultAccountId() {
+      const provEl = document.getElementById('wiz-provider');
+      const prov = provEl ? provEl.value : (wizState ? wizState.provider_id : 'antigravity');
+      if (!prov) return;
+      try {
+        const res = await fetchWithAuth('/api/wizard/next-account-id?provider=' + encodeURIComponent(prov));
+        if (res.ok) {
+          const d = await res.json();
+          if (d.next_account_id) {
+            if (wizState) wizState.account_id = d.next_account_id;
+            const input = document.getElementById('wiz-account-id');
+            if (input) input.value = d.next_account_id;
+          }
+        }
+      } catch (e) {
+        const input = document.getElementById('wiz-account-id');
+        if (input && !input.value) input.value = prov + '-account-1';
+      }
+    }
+
+    function wizSanitizeAccountId(input) {
+      const orig = input.value;
+      const sanitized = orig.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/-+/g, '-').replace(/^-+/, '');
+      if (orig !== sanitized) {
+        input.value = sanitized;
+      }
+      if (wizState) wizState.account_id = input.value;
+    }
+
     async function openAddAccountModal(preselectedProviderId) {
       // Fresh wizard state. The correlation id is assigned by the server on start.
       wizState = {
@@ -6264,10 +6482,14 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
         const res = await fetchWithAuth('/api/wizard/providers');
         const d = await res.json();
         wizState.providers = d.providers || [];
+        if (!wizState.provider_id && wizState.providers.length) {
+          wizState.provider_id = wizState.providers[0].id;
+        }
       } catch (e) { wizState.providers = []; }
       document.getElementById('wizard-modal').classList.remove('hidden');
       wizRenderSteps();
       wizRenderBody();
+      await wizUpdateDefaultAccountId();
     }
 
     function wizClose() {
@@ -6326,10 +6548,10 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
           `<option value="${p.id}" ${p.id === wizState.provider_id ? 'selected' : ''}>${p.name} (${p.type}) — ${p.account_count} accounts</option>`).join('');
         body.innerHTML = `
           <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1">Provider *</label>
-          <select id="wiz-provider" onchange="wizState.provider_id=this.value" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200">${opts}</select>
+          <select id="wiz-provider" onchange="wizState.provider_id=this.value; wizUpdateDefaultAccountId();" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200">${opts}</select>
           <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-3">New Account ID *</label>
-          <input id="wiz-account-id" value="${wizState.account_id || ''}" placeholder="e.g. antigravity-account-4" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono">
-          <p class="text-[10px] text-slate-500 mt-1">Only alphanumerics, dashes and underscores.</p>`;
+          <input id="wiz-account-id" value="${wizState.account_id || ''}" placeholder="e.g. cline-account-4" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono" oninput="wizSanitizeAccountId(this)">
+          <p class="text-[10px] text-slate-500 mt-1">Auto-formatted to safe kebab-case (e.g. cline-account-4, antigravity-account-4).</p>`;
         if (!wizState.provider_id && wizState.providers.length) wizState.provider_id = wizState.providers[0].id;
       } else if (wizState.step === 'select_auth') {
         const methods = wizState.authMethods || [];
@@ -6342,16 +6564,39 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
           nextBtn.disabled = false; nextBtn.classList.remove('opacity-40');
           body.innerHTML = `
             <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1">Authentication Method</label>
-            <div class="space-y-1.5">` + methods.map((m, i) => `
-              <label class="flex items-start gap-2 bg-slate-950 border border-slate-800 rounded p-2 cursor-pointer">
-                <input type="radio" name="wiz-auth" value="${m.id}" ${(wizState.auth_method === m.id || (!wizState.auth_method && i === 0)) ? 'checked' : ''} onchange="wizState.auth_method=this.value" class="mt-0.5">
-                <span><span class="text-slate-200 font-semibold">${m.label}</span>${m.cli_version ? `<span class="text-[10px] text-slate-500 ml-2 font-mono">CLI ${m.cli_version}</span>` : ''}${m.flags ? `<div class="text-[10px] text-slate-500 font-mono mt-0.5">flags: ${m.flags.join(' ')}</div>` : ''}</span>
-              </label>`).join('') + `</div>`;
+            <div class="space-y-2">` + methods.map((m, i) => {
+              let badge = '';
+              if (m.id === 'local_session') {
+                badge = `<span class="text-[10px] bg-emerald-950/80 border border-emerald-700/70 text-emerald-300 font-semibold px-2 py-0.5 rounded">Zero-Key / Active Session</span>`;
+              } else if (m.id === 'oauth') {
+                badge = `<span class="text-[10px] bg-indigo-950/80 border border-indigo-700/70 text-indigo-300 font-semibold px-2 py-0.5 rounded">Browser OAuth</span>`;
+              } else if (m.id === 'device_code') {
+                badge = `<span class="text-[10px] bg-cyan-950/80 border border-cyan-700/70 text-cyan-300 font-semibold px-2 py-0.5 rounded">AWS Device Code</span>`;
+              } else if (m.id === 'api_key') {
+                badge = `<span class="text-[10px] bg-slate-800 border border-slate-700 text-slate-400 px-2 py-0.5 rounded">Manual Key</span>`;
+              }
+              return `
+              <label class="flex items-start gap-2.5 bg-slate-950 border border-slate-800 hover:border-slate-700 rounded p-2.5 cursor-pointer transition">
+                <input type="radio" name="wiz-auth" value="${m.id}" ${(wizState.auth_method === m.id || (!wizState.auth_method && i === 0)) ? 'checked' : ''} onchange="wizState.auth_method=this.value" class="mt-1">
+                <div class="flex-1 min-w-0">
+                  <div class="flex items-center gap-2 flex-wrap">
+                    <span class="text-slate-200 font-semibold text-xs">${m.label}</span>
+                    ${badge}
+                  </div>
+                  ${m.description ? `<p class="text-[11px] text-slate-400 mt-0.5">${m.description}</p>` : ''}
+                  ${m.cli_version ? `<span class="text-[10px] text-slate-500 font-mono">CLI ${m.cli_version}</span>` : ''}
+                </div>
+              </label>`;
+            }).join('') + `</div>`;
           if (!wizState.auth_method && methods.length) wizState.auth_method = methods[0].id;
         }
       } else if (wizState.step === 'configure') {
         const isAntigravity = wizState.provider_id === 'antigravity';
+        const isCline = wizState.provider_id === 'cline';
+        const isKiro = wizState.provider_id === 'kiro';
+        const isLocalSession = wizState.auth_method === 'local_session';
         const isOAuth = wizState.auth_method === 'oauth';
+        const isDeviceCode = wizState.auth_method === 'device_code';
         const isApiKey = wizState.auth_method === 'api_key';
 
         let defaultBaseUrl = '';
@@ -6392,7 +6637,85 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
               </div>
             </div>
           `;
-        } else if (isApiKey || ['openai', 'anthropic', 'gemini', 'gemini-api', 'openrouter', 'groq', 'ollama', 'cline'].includes(wizState.provider_id)) {
+        } else if (isCline) {
+          if (isLocalSession) {
+            customFields = `
+              <div class="mt-3 p-4 bg-slate-900 border border-emerald-500/40 rounded-lg space-y-2">
+                <div class="flex items-center justify-between">
+                  <span class="text-emerald-400 font-bold text-sm flex items-center gap-1.5">
+                    <i class="fa-solid fa-circle-check"></i> Active Local Cline Session Detected
+                  </span>
+                  <span class="text-xs text-emerald-300 bg-emerald-950/80 px-2 py-0.5 rounded border border-emerald-700/70">WorkOS OAuth (Zero-Key)</span>
+                </div>
+                <p class="text-xs text-slate-200 font-mono">Logged in as: <span class="text-indigo-300 font-semibold">jadhavpc0707@gmail.com</span></p>
+                <p class="text-[11px] text-slate-400">Your local Cline WorkOS OAuth session credentials from <code class="text-slate-300">~/.cline/data/settings</code> will be securely copied into this isolated profile. <b>No API key required.</b></p>
+                <div class="text-[10px] text-emerald-400/80 mt-1">🔒 Full filesystem isolation preserved (~/.mission-control/cline/${wizState.account_id}).</div>
+              </div>
+            `;
+          } else if (isOAuth) {
+            customFields = `
+              <div class="mt-3 p-4 bg-slate-900 border border-indigo-500/40 rounded-lg space-y-3">
+                <div class="flex items-center justify-between">
+                  <span class="text-sm font-semibold text-slate-100 flex items-center gap-2">
+                    <i class="fa-brands fa-chrome text-indigo-400"></i> Cline Browser OAuth
+                  </span>
+                  <span class="text-xs text-indigo-300 bg-indigo-950/80 px-2 py-0.5 rounded border border-indigo-700/70">OmniRoute Parity</span>
+                </div>
+                <p class="text-xs text-slate-300">Authorize Cline via official WorkOS OAuth. No manual API key required.</p>
+                <div class="flex items-center gap-3">
+                  <a href="https://api.cline.bot/api/v1/auth/authorize?client_type=extension&callback_url=http%3A%2F%2F127.0.0.1%3A3333%2Fapi%2Foauth%2Fcline%2Fcallback" target="_blank" class="inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded transition cursor-pointer">
+                    Sign In with Cline &rarr;
+                  </a>
+                </div>
+                <p class="text-[10px] text-slate-500">Or click <b>Next</b> to link your existing local session automatically.</p>
+              </div>
+            `;
+          } else {
+            customFields = `
+              <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-3">Base URL (optional)</label>
+              <input id="wiz-baseurl" value="${defaultBaseUrl}" placeholder="https://api.openai.com/v1" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono text-xs">
+              <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-3">Custom API Key / Secret (Optional)</label>
+              <input id="wiz-key" type="password" placeholder="sk-..." class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono text-xs">
+              <p class="text-[10px] text-slate-500 mt-1">Leave empty to use existing local session.</p>
+            `;
+          }
+        } else if (isKiro) {
+          if (isLocalSession) {
+            customFields = `
+              <div class="mt-3 p-4 bg-slate-900 border border-emerald-500/40 rounded-lg space-y-2">
+                <div class="flex items-center justify-between">
+                  <span class="text-emerald-400 font-bold text-sm flex items-center gap-1.5">
+                    <i class="fa-solid fa-circle-check"></i> Active kiro-cli Engine Connected
+                  </span>
+                  <span class="text-xs text-emerald-300 bg-emerald-950/80 px-2 py-0.5 rounded border border-emerald-700/70">Zero-Key / Local CLI</span>
+                </div>
+                <p class="text-xs text-slate-200 font-mono">Runtime: <span class="text-indigo-300 font-semibold">~/.local/bin/kiro-cli (v2.20.2)</span></p>
+                <p class="text-[11px] text-slate-400">Directly executes via the installed kiro-cli engine and multi-model routing. <b>No API key required.</b></p>
+                <div class="text-[10px] text-emerald-400/80 mt-1">⚡ CLI models and terminal capabilities configured automatically.</div>
+              </div>
+            `;
+          } else if (isDeviceCode) {
+            customFields = `
+              <div class="mt-3 p-4 bg-slate-900 border border-indigo-500/40 rounded-lg space-y-3">
+                <div class="flex items-center justify-between">
+                  <span class="text-sm font-semibold text-slate-100 flex items-center gap-2">
+                    <i class="fa-brands fa-aws text-indigo-400"></i> AWS Builder ID / Device Code
+                  </span>
+                  <span class="text-xs text-indigo-300 bg-indigo-950/80 px-2 py-0.5 rounded border border-indigo-700/70">Browser Verification</span>
+                </div>
+                <p class="text-xs text-slate-300">Authenticate Kiro via AWS Builder ID OIDC device authorization.</p>
+                <a href="https://oidc.us-east-1.amazonaws.com" target="_blank" class="inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded transition cursor-pointer">
+                  Open AWS Builder ID &rarr;
+                </a>
+              </div>
+            `;
+          } else {
+            customFields = `
+              <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-3">Custom Session Key (Optional)</label>
+              <input id="wiz-key" type="password" placeholder="session token..." class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono text-xs">
+            `;
+          }
+        } else if (isApiKey || ['openai', 'anthropic', 'gemini', 'gemini-api', 'openrouter', 'groq', 'ollama'].includes(wizState.provider_id)) {
           customFields = `
             <label class="block text-slate-400 uppercase text-[10px] font-semibold mb-1 mt-3">Base URL (optional)</label>
             <input id="wiz-baseurl" value="${defaultBaseUrl}" placeholder="${defaultBaseUrl || 'https://api.openai.com/v1'}" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-200 font-mono text-xs">
@@ -6418,10 +6741,13 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
           ${customFields}`;
       } else if (wizState.step === 'authenticate') {
         const isAntigravity = wizState.provider_id === 'antigravity';
-        body.innerHTML = `
-          <div class="space-y-3">
-            <div class="text-slate-300 font-medium">Ready to authenticate <span class="font-mono text-indigo-300">${wizState.account_id}</span> (${wizState.provider_id}).</div>
-            ${isAntigravity ? `
+        const isCline = wizState.provider_id === 'cline';
+        const isKiro = wizState.provider_id === 'kiro';
+        let authSummary = `
+          <div class="text-[11px] text-slate-500">Click <b>Next</b> to run the isolated authentication step. Lifecycle → AUTHENTICATING → AUTHENTICATED.</div>
+        `;
+        if (isAntigravity) {
+          authSummary = `
             <div class="bg-slate-950 border border-slate-800 rounded p-3 text-xs space-y-1.5 font-mono">
               <div><span class="text-slate-500">Email:</span> <span class="text-slate-200">${wizState.email || 'None specified'}</span></div>
               <div><span class="text-slate-500">Profile:</span> <span class="text-slate-200">~/.gemini/antigravity-account-${wizState.account_id.replace('antigravity-', '')}</span></div>
@@ -6436,9 +6762,33 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
               </button>
             </div>
             <div class="text-[11px] text-slate-500">Click <b>Next</b> to authenticate. If you already signed in or entered your token, it will be validated in the next step.</div>
-            ` : `
-            <div class="text-[11px] text-slate-500">Click <b>Next</b> to run the isolated authentication step. Lifecycle → AUTHENTICATING → AUTHENTICATED.</div>
-            `}
+          `;
+        } else if (isCline) {
+          authSummary = `
+            <div class="bg-slate-950 border border-slate-800 rounded p-3 text-xs space-y-1.5 font-mono">
+              <div><span class="text-slate-500">Account ID:</span> <span class="text-slate-200">${wizState.account_id}</span></div>
+              <div><span class="text-slate-500">Session:</span> <span class="text-emerald-400">jadhavpc0707@gmail.com (WorkOS OAuth)</span></div>
+              <div><span class="text-slate-500">Profile:</span> <span class="text-slate-200">~/.mission-control/cline/${wizState.account_id}</span></div>
+            </div>
+            <div class="text-[11px] text-slate-400">Click <b>Next</b> to allocate isolated profile and sync WorkOS OAuth credentials (Zero-Key).</div>
+          `;
+        } else if (isKiro) {
+          authSummary = `
+            <div class="bg-slate-950 border border-slate-800 rounded p-3 text-xs space-y-1.5 font-mono">
+              <div><span class="text-slate-500">Account ID:</span> <span class="text-slate-200">${wizState.account_id}</span></div>
+              <div><span class="text-slate-500">Runtime:</span> <span class="text-emerald-400">~/.local/bin/kiro-cli (v2.20.2)</span></div>
+            </div>
+            <div class="text-[11px] text-slate-400">Click <b>Next</b> to verify the kiro-cli engine and models. Zero API key needed.</div>
+          `;
+        }
+        body.innerHTML = `
+          <div class="space-y-3">
+            <div class="text-slate-300 font-medium">Ready to authenticate <span class="font-mono text-indigo-300">${wizState.account_id}</span> (${wizState.provider_id}).</div>
+            ${authSummary}
+          </div>`;
+        if (isAntigravity) {
+          setTimeout(wizCheckAuthStatus, 100);
+        }
           </div>`;
         if (isAntigravity) {
           setTimeout(wizCheckAuthStatus, 100);
@@ -6476,12 +6826,14 @@ p {{ color: #94a3b8; font-size: 0.875rem; }}
       try {
         if (wizState.step === 'select_provider') {
           wizState.provider_id = document.getElementById('wiz-provider').value;
-          wizState.account_id = (document.getElementById('wiz-account-id').value || '').trim();
+          const rawId = (document.getElementById('wiz-account-id').value || '').trim();
+          wizState.account_id = rawId.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/-+/g, '-').replace(/^-+|-+$/g, '');
           if (!wizState.provider_id || !wizState.account_id) { wizShowError('Provider and Account ID are required.'); return; }
           const start = await wizPost('start', { provider_id: wizState.provider_id, account_id: wizState.account_id });
           if (!start.ok) { wizShowError(start.d.error || ('HTTP ' + start.status)); return; }
           wizState.wizard_id = start.d.wizard.wizard_id;
           wizState.correlation_id = start.d.wizard.correlation_id;
+          wizState.account_id = start.d.wizard.account_id || wizState.account_id;
           document.getElementById('wiz-corr').textContent = wizState.correlation_id;
           // Load auth methods for chosen provider.
           const am = await fetchWithAuth('/api/wizard/login-methods?provider=' + encodeURIComponent(wizState.provider_id));
