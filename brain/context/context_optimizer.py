@@ -232,16 +232,23 @@ class TokenRecord:
     provider: str
     requested_model: str | None
     actual_model: str
-    input_tokens: int = 0
-    output_tokens: int = 0
-    total_tokens: int = 0
-    cache_read_tokens: int = 0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+    cache_read_tokens: int | None = None
     duration_seconds: float = 0.0
     status: str = "known"  # 'known', 'estimated', 'unknown'
+    usage_source: str = "unknown"  # 'reported', 'parsed', 'estimated', 'unknown'
     task_type: str = "normal"
     complexity: str = "standard"
     success: bool = True
+    started_at: str | None = None
+    completed_at: str | None = None
     timestamp: str = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).isoformat())
+
+    @property
+    def model(self) -> str:
+        return self.actual_model
 
     @property
     def token_reporting(self) -> str:
@@ -249,11 +256,14 @@ class TokenRecord:
         return self.status
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        d["model"] = self.actual_model
+        return d
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TokenRecord:
-        return cls(**data)
+        known = {f for f in cls.__dataclass_fields__}
+        return cls(**{k: v for k, v in data.items() if k in known})
 
 
 class TokenTelemetryTracker:
@@ -279,31 +289,41 @@ class TokenTelemetryTracker:
         provider: str,
         requested_model: str | None,
         actual_model: str,
-        input_tokens: int | None = 0,
-        output_tokens: int | None = 0,
-        total_tokens: int | None = 0,
-        cache_read_tokens: int | None = 0,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        total_tokens: int | None = None,
+        cache_read_tokens: int | None = None,
         duration_seconds: float = 0.0,
         task_type: str = "normal",
         complexity: str = "standard",
         success: bool = True,
+        usage_source: str = "unknown",
+        started_at: str | None = None,
+        completed_at: str | None = None,
         raw_response: dict[str, Any] | None = None,
     ) -> TokenRecord:
         """Record honest token telemetry. Never claims known metrics if unreported."""
-        inp = int(input_tokens or 0)
-        out = int(output_tokens or 0)
-        tot = int(total_tokens or 0)
-        cache = int(cache_read_tokens or 0)
+        inp = input_tokens if input_tokens is not None else (0 if total_tokens is not None else None)
+        out = output_tokens if output_tokens is not None else (0 if total_tokens is not None else None)
+        tot = total_tokens
+
+        # If input or output provided, compute total if total was None/0
+        if tot is None and (inp is not None or out is not None):
+            tot = (inp or 0) + (out or 0)
 
         # Determine honest status
-        if tot > 0 or inp > 0 or out > 0:
+        if usage_source == "estimated":
+            status = "estimated"
+        elif tot is not None and tot > 0:
             status = "known"
+            if usage_source == "unknown":
+                usage_source = "reported"
         else:
             status = "unknown"
-
-        # Auto-compute total if input/output provided but total is 0
-        if tot == 0 and (inp > 0 or out > 0):
-            tot = inp + out
+            usage_source = "unknown"
+            inp = None
+            out = None
+            tot = None
 
         record = TokenRecord(
             task_id=task_id,
@@ -312,15 +332,18 @@ class TokenTelemetryTracker:
             provider=provider,
             requested_model=requested_model,
             actual_model=actual_model,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            total_tokens=total_tokens,
+            input_tokens=inp,
+            output_tokens=out,
+            total_tokens=tot,
             cache_read_tokens=cache_read_tokens,
             duration_seconds=round(duration_seconds, 3),
             status=status,
+            usage_source=usage_source,
             task_type=task_type,
             complexity=complexity,
             success=success,
+            started_at=started_at,
+            completed_at=completed_at,
         )
 
         try:
@@ -334,11 +357,13 @@ class TokenTelemetryTracker:
                 EventType.TOKEN_USAGE_RECORDED,
                 agent_id=agent_id,
                 task_id=task_id,
+                provider=provider,
                 metadata={
-                    "total_tokens": total_tokens,
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
+                    "total_tokens": tot,
+                    "input_tokens": inp,
+                    "output_tokens": out,
                     "status": status,
+                    "usage_source": usage_source,
                     "duration_seconds": duration_seconds,
                     "actual_model": actual_model,
                 },
@@ -347,7 +372,7 @@ class TokenTelemetryTracker:
         return record
 
     def get_metrics(self) -> dict[str, Any]:
-        """Aggregate token telemetry across agents, models, and status tiers."""
+        """Aggregate token telemetry across agents, models, providers, and status tiers."""
         records: list[TokenRecord] = []
         if self._log_path.is_file():
             try:
@@ -361,38 +386,78 @@ class TokenTelemetryTracker:
 
         total_tasks = len(records)
         known_tokens = 0
+        estimated_tokens = 0
         unknown_count = 0
+        total_input = 0
+        total_output = 0
+
         by_agent: dict[str, dict[str, Any]] = {}
         by_model: dict[str, dict[str, Any]] = {}
+        by_provider: dict[str, dict[str, Any]] = {}
 
         for r in records:
-            if r.status == "known":
+            if r.status == "known" and r.total_tokens is not None:
                 known_tokens += r.total_tokens
-            elif r.status == "unknown":
+                if r.input_tokens is not None:
+                    total_input += r.input_tokens
+                if r.output_tokens is not None:
+                    total_output += r.output_tokens
+            elif r.status == "estimated" and r.total_tokens is not None:
+                estimated_tokens += r.total_tokens
+            else:
                 unknown_count += 1
+
+            # Group by provider
+            p_key = r.provider or "unknown"
+            if p_key not in by_provider:
+                by_provider[p_key] = {
+                    "tasks": 0,
+                    "known_tokens": 0,
+                    "estimated_tokens": 0,
+                    "unknown_usage_runs": 0,
+                    "total_duration": 0.0,
+                }
+            by_provider[p_key]["tasks"] += 1
+            if r.status == "known" and r.total_tokens is not None:
+                by_provider[p_key]["known_tokens"] += r.total_tokens
+            elif r.status == "estimated" and r.total_tokens is not None:
+                by_provider[p_key]["estimated_tokens"] += r.total_tokens
+            else:
+                by_provider[p_key]["unknown_usage_runs"] += 1
+            by_provider[p_key]["total_duration"] += r.duration_seconds
 
             # Group by agent
             if r.agent_id not in by_agent:
                 by_agent[r.agent_id] = {
                     "tasks": 0,
                     "known_tokens": 0,
+                    "estimated_tokens": 0,
+                    "unknown_usage_runs": 0,
                     "total_duration": 0.0,
                     "success_count": 0,
                 }
             by_agent[r.agent_id]["tasks"] += 1
-            if r.status == "known":
+            if r.status == "known" and r.total_tokens is not None:
                 by_agent[r.agent_id]["known_tokens"] += r.total_tokens
+            elif r.status == "estimated" and r.total_tokens is not None:
+                by_agent[r.agent_id]["estimated_tokens"] += r.total_tokens
+            else:
+                by_agent[r.agent_id]["unknown_usage_runs"] += 1
             by_agent[r.agent_id]["total_duration"] += r.duration_seconds
             if r.success:
                 by_agent[r.agent_id]["success_count"] += 1
 
             # Group by model
-            m_key = r.actual_model
+            m_key = r.actual_model or "unknown"
             if m_key not in by_model:
-                by_model[m_key] = {"tasks": 0, "known_tokens": 0}
+                by_model[m_key] = {"tasks": 0, "known_tokens": 0, "estimated_tokens": 0, "unknown_usage_runs": 0}
             by_model[m_key]["tasks"] += 1
-            if r.status == "known":
+            if r.status == "known" and r.total_tokens is not None:
                 by_model[m_key]["known_tokens"] += r.total_tokens
+            elif r.status == "estimated" and r.total_tokens is not None:
+                by_model[m_key]["estimated_tokens"] += r.total_tokens
+            else:
+                by_model[m_key]["unknown_usage_runs"] += 1
 
         # Compute averages
         for a_id, data in by_agent.items():
@@ -402,9 +467,19 @@ class TokenTelemetryTracker:
             data["success_rate"] = round(data["success_count"] / tasks, 3) if tasks else 0.0
 
         return {
+            "totals": {
+                "input_tokens": total_input,
+                "output_tokens": total_output,
+                "total_tokens": known_tokens + estimated_tokens,
+            },
+            "by_provider": by_provider,
+            "by_agent": by_agent,
+            "by_model": by_model,
+            "known_tokens": known_tokens,
+            "estimated_tokens": estimated_tokens,
+            "unknown_usage_runs": unknown_count,
+            # Backwards-compatible aliases
             "total_tasks_recorded": total_tasks,
             "total_known_tokens": known_tokens,
             "unknown_metric_tasks": unknown_count,
-            "by_agent": by_agent,
-            "by_model": by_model,
         }

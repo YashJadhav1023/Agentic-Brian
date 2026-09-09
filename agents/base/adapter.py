@@ -10,7 +10,7 @@ import abc
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Any
+from typing import Callable, Any, TypedDict
 
 
 class Capability(str, Enum):
@@ -57,6 +57,34 @@ class AgentStatus(str, Enum):
 UNKNOWN_MODEL = "unknown"
 
 
+class ExecutionResultUsage(TypedDict):
+    input_tokens: int | None
+    output_tokens: int | None
+    total_tokens: int | None
+    usage_source: str
+
+
+class ExecutionResultError(TypedDict, total=False):
+    type: str
+    message: str
+
+
+class ExecutionResult(TypedDict):
+    task_id: str
+    provider: str
+    agent_id: str
+    model: str
+    status: str
+    exit_code: int
+    started_at: str | None
+    completed_at: str | None
+    duration_seconds: float
+    stdout: str
+    stderr: str
+    usage: ExecutionResultUsage
+    error: ExecutionResultError | None
+
+
 @dataclass
 class TaskExecutionResult:
     """Normalized output produced by an agent execution.
@@ -75,9 +103,12 @@ class TaskExecutionResult:
     requested_model: str | None = None
     actual_model: str | None = None
     duration_seconds: float = 0.0
-    input_tokens: int = 0
-    output_tokens: int = 0
-    total_tokens: int = 0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+    usage_source: str = "unknown"
+    started_at: str | None = None
+    completed_at: str | None = None
     conversation_id: str | None = None
     files_touched: list[str] = field(default_factory=list)
     raw_response: dict[str, Any] = field(default_factory=dict)
@@ -98,6 +129,38 @@ class TaskExecutionResult:
     #: Argv actually executed, with the prompt redacted for log safety.
     command: list[str] = field(default_factory=list)
 
+    def to_execution_result(self) -> dict[str, Any]:
+        """Return the standard ExecutionResult contract for all providers."""
+        model_str = (
+            self.actual_model
+            if self.actual_model and self.actual_model != UNKNOWN_MODEL
+            else (self.requested_model or UNKNOWN_MODEL)
+        )
+        return {
+            "task_id": self.task_id,
+            "provider": self.provider,
+            "agent_id": self.agent_id,
+            "model": model_str,
+            "status": "completed" if self.success else "failed",
+            "exit_code": self.exit_code,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "duration_seconds": round(self.duration_seconds, 3),
+            "output": self.output,
+            "stdout": self.raw_stdout or self.output,
+            "stderr": self.raw_stderr or self.error,
+            "usage": {
+                "input_tokens": self.input_tokens,
+                "output_tokens": self.output_tokens,
+                "total_tokens": self.total_tokens,
+                "usage_source": self.usage_source,
+            },
+            "error": {
+                "type": "ExecutionError" if self.error else "ExecutionFailed",
+                "message": self.error or "Execution failed",
+            } if (not self.success or self.error) else None,
+        }
+
     def normalized(self) -> dict[str, Any]:
         """Return the canonical cross-provider task result schema."""
         return {
@@ -111,11 +174,12 @@ class TaskExecutionResult:
             "actual_model": self.actual_model,
             "response": self.output,
             "usage": {
-                "input_tokens": self.input_tokens,
-                "output_tokens": self.output_tokens,
+                "input_tokens": int(self.input_tokens or 0),
+                "output_tokens": int(self.output_tokens or 0),
                 "thinking_tokens": self.thinking_tokens,
                 "cache_read_tokens": self.cache_read_tokens,
-                "total_tokens": self.total_tokens,
+                "total_tokens": int(self.total_tokens or 0),
+                "usage_source": self.usage_source,
             },
             "num_turns": self.num_turns,
             "duration_seconds": self.duration_seconds,
@@ -123,7 +187,12 @@ class TaskExecutionResult:
             "status": "completed" if self.success else "failed",
             "provider_status": self.provider_status,
             "json_valid": self.json_valid,
+            "execution_result": self.to_execution_result(),
         }
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return dict representation of execution result."""
+        return self.to_execution_result()
 
 
 class AgentAdapter(abc.ABC):

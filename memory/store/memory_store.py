@@ -38,9 +38,14 @@ class MemoryEntry:
     tags: list[str] = field(default_factory=list)
     provenance: str = "system"
 
+    @property
+    def timestamp(self) -> str:
+        return self.created_at
+
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["scope"] = self.scope.value
+        d["timestamp"] = self.created_at
         return d
 
     @classmethod
@@ -103,6 +108,20 @@ class MemoryStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_task ON memories(task_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_agent ON memories(source_agent)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_created ON memories(created_at)")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS memory_retrievals (
+                    retrieval_id TEXT PRIMARY KEY,
+                    task_id TEXT,
+                    query TEXT NOT NULL,
+                    retrieved_memory_id TEXT NOT NULL,
+                    retrieval_score REAL NOT NULL,
+                    agent_id TEXT,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_retrieval_task ON memory_retrievals(task_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_retrieval_mem ON memory_retrievals(retrieved_memory_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_retrieval_time ON memory_retrievals(created_at)")
 
     def add(
         self,
@@ -149,6 +168,92 @@ class MemoryStore:
                 entry.provenance,
             ))
         return entry
+
+    def record_retrieval(
+        self,
+        query: str,
+        retrieved_memory_id: str,
+        retrieval_score: float,
+        task_id: str | None = None,
+        agent_id: str | None = None,
+    ) -> str:
+        ret_id = f"ret-{uuid.uuid4().hex[:8]}"
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute("""
+                INSERT INTO memory_retrievals (
+                    retrieval_id, task_id, query, retrieved_memory_id, retrieval_score, agent_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (ret_id, task_id, query, retrieved_memory_id, retrieval_score, agent_id, now))
+        return ret_id
+
+    def list_retrievals(self, limit: int = 100, task_id: str | None = None) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            if task_id:
+                cursor = conn.execute(
+                    "SELECT * FROM memory_retrievals WHERE task_id = ? ORDER BY created_at DESC LIMIT ?",
+                    (task_id, limit),
+                )
+            else:
+                cursor = conn.execute(
+                    "SELECT * FROM memory_retrievals ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                )
+            rows = cursor.fetchall()
+            return [
+                {
+                    "retrieval_id": r[0],
+                    "task_id": r[1],
+                    "query": r[2],
+                    "retrieved_memory_id": r[3],
+                    "retrieval_score": round(r[4], 2),
+                    "agent_id": r[5],
+                    "created_at": r[6],
+                }
+                for r in rows
+            ]
+
+    def get_memory(self, memory_id: str) -> MemoryEntry | None:
+        with self._connect() as conn:
+            cursor = conn.execute("SELECT * FROM memories WHERE memory_id = ?", (memory_id,))
+            row = cursor.fetchone()
+            return MemoryEntry.from_row(row) if row else None
+
+    def query_memories(
+        self,
+        search: str | None = None,
+        scope: MemoryScope | None = None,
+        min_importance: int | None = None,
+        task_id: str | None = None,
+        source_agent: str | None = None,
+        limit: int = 100,
+    ) -> list[MemoryEntry]:
+        query_parts = ["SELECT * FROM memories WHERE 1=1"]
+        params: list[Any] = []
+
+        if scope:
+            query_parts.append("AND scope = ?")
+            params.append(scope.value)
+        if min_importance is not None:
+            query_parts.append("AND importance >= ?")
+            params.append(min_importance)
+        if task_id:
+            query_parts.append("AND task_id = ?")
+            params.append(task_id)
+        if source_agent:
+            query_parts.append("AND source_agent = ?")
+            params.append(source_agent)
+        if search:
+            query_parts.append("AND (content LIKE ? OR tags LIKE ?)")
+            term = f"%{search}%"
+            params.extend([term, term])
+
+        query_parts.append("ORDER BY created_at DESC LIMIT ?")
+        params.append(limit)
+
+        with self._connect() as conn:
+            cursor = conn.execute(" ".join(query_parts), params)
+            return [MemoryEntry.from_row(r) for r in cursor.fetchall()]
 
     def list_all(self, limit: int = 100) -> list[MemoryEntry]:
         with self._connect() as conn:

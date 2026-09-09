@@ -28,7 +28,7 @@ directory* that isolates the account.
 ### Verified invocation
 
 ```bash
-/home/setoo/.gemini/bin/agy \
+~/.gemini/bin/agy \
   --app_data_dir=antigravity-ide \
   --output-format json \
   --model=gemini-3.8-flash-low \

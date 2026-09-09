@@ -4,61 +4,79 @@
 python3 ui/dashboard/dashboard.py     # http://127.0.0.1:3333  (BRAIN_PORT to change)
 ```
 
-**Security posture:** the server binds `127.0.0.1` only, so it is not reachable
-from the network. Its `POST` endpoints (`/api/route`, `/api/dispatch`,
-`/api/continue`) are **unauthenticated** and dispatch real agent work, so anyone
-with local access to the machine can trigger a task. Do not bind it to `0.0.0.0`
-or expose it through a tunnel without adding authentication first.
+**Security Posture:** The server binds strictly to `127.0.0.1`. Remote network binding (`0.0.0.0`) is prohibited. All mutating actions (`/api/dispatch`, `/api/execute`, `/api/continue`, `/api/tasks/cancel`, `/api/memory/add`, `/api/worktrees/*`) require Bearer token authentication (`Authorization: Bearer <token>`). The session token is automatically generated in `runtime/mission_control.token` (permissions `0600`) and seamlessly bootstrapped by the local web UI via `/api/token`.
 
-## Agent cards
+---
 
-Every agent, including Antigravity Account 2, is rendered from the same data
-path — no agent is special-cased. Each card shows:
+## Interactive Features & Controls
 
-- health dot and lifecycle badge: `ONLINE` / `IDLE` / `WORKING` / `FAILED` / `OFFLINE`
-- account id, provider, execution mode
-- profile path (`~/.gemini/antigravity-ide` for Account 2)
-- health reason
-- current task title and status
-- requested model, and the reported model when the provider named one
-- session id and conversation id
-- duration and last activity
-- task counts: total / completed / failed
-- most recent error, if any
-- model catalogue size and the first few ids
+1. **Live Execution Monitor (`#live-execution-widget`):**
+   - Active task tracking with live stopwatch elapsed timer (`mm:ss`).
+   - 6-stage progression mapping: `Queued` → `Routing` → `Memory` → `Execution` → `Handoff` → `Complete`.
+   - Failover badge indicator and continuation budget counters.
+2. **Interactive Kanban Board (`#tab-tasks`):**
+   - Categorizes tasks into Ready Queue, Running / Active, Completed, and Terminal / Failed columns.
+   - Clicking any task card opens the **Task Detail Modal** (`GET /api/task?task_id=...`) showing title, stage, assigned agent/model, duration, errors, and output results.
+   - Individual card action triggers: "Run Now" and "Cancel".
+3. **Interactive Routing Simulator (`#tab-routing`):**
+   - Form for testing arbitrary user instructions against the 8-factor Smart Router (`POST /api/route`).
+   - Displays selected agent, model tier, score, fallback agent, and full candidate breakdown.
+4. **Interactive Memory Search & Add (`#tab-memory`):**
+   - BM25 full-text keyword search across scoped SQLite memory (`POST /api/memory/search`).
+   - Quick-add interface for storing new architectural constraints and decisions (`POST /api/memory/add`).
+5. **Worktree Diff Inspection & Approval (`#tab-worktrees`):**
+   - Visual inspection of sandbox Git diffs (`GET /api/worktrees/diff?task_id=...`).
+   - Non-destructive merge approval (`POST /api/worktrees/apply`) or rejection (`POST /api/worktrees/reject`) with required `confirm: true` guards.
 
-Status is derived from real state: `OFFLINE` when unhealthy, `WORKING` with a
-running task, `FAILED` when the newest terminal task failed, `IDLE` with history,
-`ONLINE` when idle with none.
+---
 
-## API
+## Agent Cards & Runtime Telemetry
 
-| Endpoint | Returns |
-|---|---|
-| `GET /api/status` | counters + full agent runtime block |
-| `GET /api/agents` | providers -> accounts, enriched with live task/session/event state |
-| `GET /api/health` | per-agent health, profile, skip-permissions flag, last session |
-| `GET /api/sessions` | task -> session -> conversation mapping |
-| `GET /api/tasks` | every task record |
-| `GET /api/events` | last 100 events |
-| `GET /api/memory` | memory entries + count |
-| `GET /api/handoff` | current handoff markdown |
-| `GET /api/git` | branch, commit, status |
-| `POST /api/route` | routing decision, no execution |
-| `POST /api/dispatch` | plan + queue a task |
-| `POST /api/continue` | Universal Continue, executed off-thread |
+Every agent, including Antigravity Account 2, is rendered from unified telemetry:
 
-## Task history per agent
+- Health dot and lifecycle badge: `ONLINE` / `IDLE` / `WORKING` / `FAILED` / `OFFLINE`
+- Account ID, provider, execution mode (100% headless via `--app_data_dir=antigravity-ide`)
+- Health reason and binary path
+- Current task title, stage, and status
+- Requested model, and provider-reported model when known
+- Duration, success rate, and average latency
+- Token telemetry distinguishing **Known Tokens** from **Estimated Tokens**
 
-`recent_tasks` on each agent carries the last 10 tasks with status, requested and
-reported model, conversation id, duration, files and handoff paths — enough for
-an Account 2 → Tasks view without another endpoint.
+---
 
-## Live flow
+## Complete API Contract
 
-`USER -> BRAIN -> ROUTER -> ANTIGRAVITY ACCOUNT 2 -> agy -> EXECUTION -> RESULT
--> MEMORY -> HANDOFF` is observable by polling `/api/status` (the UI refreshes
-every 3 s) or by tailing `/api/events`.
+| Endpoint | Method | Auth Required | Description |
+|---|:---:|:---:|---|
+| `GET /api/token` | `GET` | No (Loopback) | Local session Bearer token for client UI bootstrap |
+| `GET /api/status` | `GET` | No | System state, counters, agent runtime blocks, token metrics |
+| `GET /api/overview` | `GET` | No | Host specifications, active tasks, task counts, git status |
+| `GET /api/agents` | `GET` | No | Registered providers, accounts, and capabilities |
+| `GET /api/health` | `GET` | No | Per-agent health diagnostics |
+| `GET /api/tasks` | `GET` | No | All task records across queues |
+| `GET /api/task?task_id=...` | `GET` | No | Detailed inspection payload for a single task |
+| `GET /api/router/history` | `GET` | No | Historical routing decisions and candidate scores |
+| `GET /api/memory` | `GET` | No | Stored memory entries and total count |
+| `GET /api/handoff` | `GET` | No | Latest Picoschema structured handoff markdown & JSON |
+| `GET /api/events` | `GET` | No | Structured event bus stream records |
+| `GET /api/git` | `GET` | No | Current branch, commit hash, and dirty file status |
+| `GET /api/worktrees` | `GET` | No | Active git worktree sandbox records |
+| `GET /api/worktrees/diff` | `GET` | No | Unified git diff for a sandbox task |
+| `POST /api/route` | `POST` | No | Simulates 8-factor routing decision without execution |
+| `POST /api/memory/search` | `POST` | No | BM25 relevance search query across SQLite memory |
+| `POST /api/memory/add` | `POST` | **Bearer Token** | Stores a new memory entry |
+| `POST /api/dispatch` | `POST` | **Bearer Token** | Plans, queues, and begins swarm task execution |
+| `POST /api/execute` | `POST` | **Bearer Token** | Triggers background swarm execution worker |
+| `POST /api/continue` | `POST` | **Bearer Token** | Universal Continue resumed off-thread |
+| `POST /api/tasks/cancel` | `POST` | **Bearer Token** | Cancels a queued or executing task |
+| `POST /api/worktrees/apply`| `POST` | **Bearer Token** | Merges sandbox branch into `main` (`confirm: true` required) |
+| `POST /api/worktrees/reject`| `POST` | **Bearer Token** | Discards sandbox branch and cleans up (`confirm: true` required) |
+| `POST /api/worktrees/cleanup`| `POST` | **Bearer Token** | Prunes stale worktrees older than specified threshold |
 
-The existing tab layout, styling and static assets were preserved; only the data
-path and the card contents changed.
+---
+
+## Live Flow & Reactivity
+
+The pipeline:
+$$\text{USER} \longrightarrow \text{MISSION CONTROL UI} \longrightarrow \text{SMART ROUTER} \longrightarrow \text{AGENT EXECUTION} \longrightarrow \text{MEMORY} \longrightarrow \text{HANDOFF} \longrightarrow \text{TELEMETRY}$$
+updates dynamically via 2.5-second polling intervals (`refreshData()`). Non-blocking toast notifications alert the operator of successful dispatches, memory writes, or API errors.

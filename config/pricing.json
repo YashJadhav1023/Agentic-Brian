@@ -1,0 +1,122 @@
+{
+  "ollama/*": {
+    "model_id": "ollama/*",
+    "provider_id": "ollama",
+    "input_cost_per_1m": 0.0,
+    "output_cost_per_1m": 0.0,
+    "pricing_type": "free",
+    "description": "Ollama local execution"
+  },
+  "deepseek/deepseek-v4-flash": {
+    "model_id": "deepseek/deepseek-v4-flash",
+    "provider_id": "cline",
+    "input_cost_per_1m": 0.0,
+    "output_cost_per_1m": 0.0,
+    "pricing_type": "free",
+    "description": "Cline OAuth free usage billing ($0.00 cost)"
+  },
+  "gpt-4o": {
+    "model_id": "gpt-4o",
+    "provider_id": "",
+    "input_cost_per_1m": 5.0,
+    "output_cost_per_1m": 15.0,
+    "pricing_type": "paid",
+    "description": ""
+  },
+  "gpt-4o-mini": {
+    "model_id": "gpt-4o-mini",
+    "provider_id": "openai",
+    "input_cost_per_1m": 0.15,
+    "output_cost_per_1m": 0.6,
+    "pricing_type": "paid",
+    "description": "OpenAI GPT-4o mini"
+  },
+  "gpt-4-turbo": {
+    "model_id": "gpt-4-turbo",
+    "provider_id": "openai",
+    "input_cost_per_1m": 10.0,
+    "output_cost_per_1m": 30.0,
+    "pricing_type": "paid",
+    "description": "OpenAI GPT-4 Turbo"
+  },
+  "gpt-3.5-turbo": {
+    "model_id": "gpt-3.5-turbo",
+    "provider_id": "openai",
+    "input_cost_per_1m": 0.5,
+    "output_cost_per_1m": 1.5,
+    "pricing_type": "paid",
+    "description": "OpenAI GPT-3.5 Turbo"
+  },
+  "claude-3-5-sonnet-20241022": {
+    "model_id": "claude-3-5-sonnet-20241022",
+    "provider_id": "anthropic",
+    "input_cost_per_1m": 3.0,
+    "output_cost_per_1m": 15.0,
+    "pricing_type": "paid",
+    "description": "Anthropic Claude 3.5 Sonnet"
+  },
+  "claude-3-5-sonnet": {
+    "model_id": "claude-3-5-sonnet",
+    "provider_id": "anthropic",
+    "input_cost_per_1m": 3.0,
+    "output_cost_per_1m": 15.0,
+    "pricing_type": "paid",
+    "description": "Anthropic Claude 3.5 Sonnet alias"
+  },
+  "claude-3-haiku-20240307": {
+    "model_id": "claude-3-haiku-20240307",
+    "provider_id": "anthropic",
+    "input_cost_per_1m": 0.25,
+    "output_cost_per_1m": 1.25,
+    "pricing_type": "paid",
+    "description": "Anthropic Claude 3 Haiku"
+  },
+  "claude-3-opus-20240229": {
+    "model_id": "claude-3-opus-20240229",
+    "provider_id": "anthropic",
+    "input_cost_per_1m": 15.0,
+    "output_cost_per_1m": 75.0,
+    "pricing_type": "paid",
+    "description": "Anthropic Claude 3 Opus"
+  },
+  "gemini-1.5-flash": {
+    "model_id": "gemini-1.5-flash",
+    "provider_id": "gemini",
+    "input_cost_per_1m": 0.075,
+    "output_cost_per_1m": 0.3,
+    "pricing_type": "paid",
+    "description": "Google Gemini 1.5 Flash"
+  },
+  "gemini-1.5-pro": {
+    "model_id": "gemini-1.5-pro",
+    "provider_id": "gemini",
+    "input_cost_per_1m": 1.25,
+    "output_cost_per_1m": 5.0,
+    "pricing_type": "paid",
+    "description": "Google Gemini 1.5 Pro"
+  },
+  "gemini-2.0-flash": {
+    "model_id": "gemini-2.0-flash",
+    "provider_id": "gemini",
+    "input_cost_per_1m": 0.1,
+    "output_cost_per_1m": 0.4,
+    "pricing_type": "paid",
+    "description": "Google Gemini 2.0 Flash"
+  },
+  "claude-3-5-sonnet-custom": {
+    "model_id": "claude-3-5-sonnet-custom",
+    "provider_id": "",
+    "input_cost_per_1m": 2.5,
+    "output_cost_per_1m": 10.0,
+    "pricing_type": "custom",
+    "description": ""
+  },
+  "ollama-llama3": {
+    "model_id": "ollama-llama3",
+    "provider_id": "",
+    "input_cost_per_1m": 0.0,
+    "output_cost_per_1m": 0.0,
+    "pricing_type": "free",
+    "description": ""
+  }
+}

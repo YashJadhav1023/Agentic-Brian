@@ -28,7 +28,13 @@ class TestSmartRouter(unittest.TestCase):
 
     def test_route_frontend_to_cline(self):
         dec = self.router.route("Fix CSS flexbox styling on the navigation layout")
-        self.assertEqual(dec.agent_id, "cline")
+        # BUG-005: cline now registers three isolated accounts; a frontend
+        # styling task must resolve to one of them, not the legacy collapsed
+        # "cline" identity.
+        self.assertTrue(
+            dec.agent_id.startswith("cline-account-"),
+            f"frontend task routed to {dec.agent_id}, expected a cline account",
+        )
 
     # --- Account 2 competes on merit ----------------------------------
     def test_account2_wins_review_without_being_named(self):
@@ -45,8 +51,15 @@ class TestSmartRouter(unittest.TestCase):
     def test_every_healthy_agent_is_scored_as_a_candidate(self):
         candidates = self.router.score_candidates("Review and refactor this service")
         ids = {c.agent_id for c in candidates}
+        # BUG-005: every configured account (incl. all three cline accounts)
+        # must be scored as an individual candidate.
         self.assertEqual(
-            ids, {"antigravity-account-1", "antigravity-account-2", "kiro-cli", "cline"}
+            ids,
+            {
+                "antigravity-account-1", "antigravity-account-2",
+                "antigravity-account-3", "kiro-cli",
+                "cline-account-1", "cline-account-2", "cline-account-3",
+            },
         )
         self.assertEqual(candidates, sorted(candidates, key=lambda c: c.score, reverse=True))
 

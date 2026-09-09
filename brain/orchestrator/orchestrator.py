@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 from brain.context.continuator import ContinueContext, UniversalContinuator
+from brain.orchestrator.job import Job
+from brain.orchestrator.job_manager import JobManager
 from brain.orchestrator.swarm import SwarmWorkerPool
 from brain.router.smart_router import SmartRouter
 from brain.worktree.worktree_manager import WorktreeManager
@@ -24,6 +26,15 @@ from providers.registry.bootstrap import create_default_registry
 from providers.registry.provider_registry import ProviderRegistry
 from sessions.session_manager import SessionManager
 from tasks.manager import Task, TaskManager, TaskPriority, TaskStatus
+
+# BUG-002 fix (full-system validation): destructive instructions queued through
+# plan_and_dispatch must never auto-execute from the shared swarm queue. The
+# same verb classes used by the Phase 18 TaskDecomposer DESTRUCTIVE_PATTERN are
+# stamped onto the task here and enforced again at queue pickup (swarm).
+DESTRUCTIVE_INSTRUCTION_PATTERN = re.compile(
+    r"\b(delete|destroy|drop|purge|rm\s+-rf|truncate|erase|wipe|kill)\b",
+    re.IGNORECASE,
+)
 
 
 class Orchestrator:
@@ -63,10 +74,18 @@ class Orchestrator:
             workspace_dir=self._workspace,
             worktree_manager=self._worktree_manager,
         )
+        self._job_manager = JobManager(
+            provider_registry=self._registry,
+            storage_dir=self._workspace / "tasks" / "jobs",
+        )
 
     # ------------------------------------------------------------------
     # Accessors
     # ------------------------------------------------------------------
+    @property
+    def jobs(self) -> JobManager:
+        return self._job_manager
+
     @property
     def worktrees(self) -> WorktreeManager:
         return self._worktree_manager
@@ -327,10 +346,25 @@ class Orchestrator:
             ) or task
             return task
 
+        self._event_bus.publish(
+            EventType.ROUTE_STARTED,
+            metadata={"instruction": instruction[:200], "preferred_agent": preferred_agent},
+        )
         decision = self._router.route(
             task_text=instruction,
             preferred_agent=preferred_agent,
             preferred_model=preferred_model,
+        )
+        self._event_bus.publish(
+            EventType.ROUTE_SELECTED,
+            agent_id=decision.agent_id,
+            provider=decision.provider,
+            metadata={
+                "assigned_model": decision.model,
+                "complexity": decision.complexity.value,
+                "reason": decision.reason,
+                "fallback_agent": decision.fallback_agent_id,
+            },
         )
 
         task = self._task_manager.create_task(
@@ -357,6 +391,14 @@ class Orchestrator:
             task.execution_options = dict(execution_options)
         if conversation_id:
             task.conversation_id = conversation_id
+        # BUG-002 fix: stamp the Phase 18 approval gate onto the queued task so
+        # the swarm (and any other queue consumer) cannot auto-execute it.
+        if DESTRUCTIVE_INSTRUCTION_PATTERN.search(instruction):
+            task.requires_approval = True
+            task.approval_reason = (
+                "Instruction matches destructive operation pattern; "
+                "explicit operator approval required before execution"
+            )
         self._task_manager.save_task(task)
 
         self._event_bus.publish(
@@ -373,6 +415,7 @@ class Orchestrator:
                 "fallback_agent": decision.fallback_agent_id,
                 "task_type": task_type,
                 "continuation_depth": continuation_depth,
+                "requires_approval": task.requires_approval,
             },
         )
         self._event_bus.publish(
@@ -381,8 +424,89 @@ class Orchestrator:
             task_id=task.task_id,
             metadata={"account_id": decision.account_id, "model": decision.model},
         )
+        self._event_bus.publish(
+            EventType.TASK_QUEUED,
+            agent_id=decision.agent_id,
+            task_id=task.task_id,
+            provider=decision.provider,
+            metadata={"stage": "QUEUED"},
+        )
 
         return task
+
+    def approve_task(self, task_id: str, approver: str = "operator") -> Task | None:
+        """Explicitly approve a gated task, releasing it to the READY queue.
+
+        BUG-002 fix companion API: destructive instructions are queued in
+        BLOCKED_ON_APPROVAL and can only reach the swarm through this method.
+        """
+        task = self._task_manager.get_task(task_id)
+        if not task:
+            return None
+        if not task.requires_approval:
+            return task
+        task.requires_approval = False
+        task.approval_reason = f"approved by {approver}"
+        # Persist the flag change first: update_status() re-reads the record
+        # from disk, so in-memory mutations alone would be discarded.
+        self._task_manager.save_task(task)
+        self._task_manager.update_status(task.task_id, TaskStatus.READY, stage="QUEUED")
+        self._event_bus.publish(
+            EventType.TASK_RECONCILED,
+            agent_id=task.assigned_agent,
+            task_id=task.task_id,
+            metadata={
+                "action": "APPROVAL_GRANTED",
+                "approver": approver,
+                "approval_reason": task.approval_reason,
+            },
+        )
+        return self._task_manager.get_task(task_id)
+
+    def reject_task(self, task_id: str, reason: str = "rejected by operator") -> Task | None:
+        """Reject a gated (or any queued) task, terminating it without execution."""
+        task = self._task_manager.get_task(task_id)
+        if not task:
+            return None
+        task.requires_approval = False
+        task.approval_reason = reason
+        self._task_manager.save_task(task)
+        updated = self._task_manager.update_status(
+            task.task_id,
+            TaskStatus.REJECTED,
+            is_terminal=True,
+            terminal_reason="REJECTED",
+            error=f"Task rejected without execution: {reason}",
+            stage="FAILED",
+        )
+        self._event_bus.publish(
+            EventType.TASK_RECONCILED,
+            agent_id=task.assigned_agent,
+            task_id=task.task_id,
+            metadata={
+                "action": "APPROVAL_REJECTED",
+                "approver": "operator",
+                "reason": reason,
+            },
+        )
+        return updated
+
+    # pending_approval_tasks() below complements the richer approve_task /
+    # reject_task API (kept from the parallel fix); the duplicate minimal
+    # approve_task was removed to avoid shadowing the approver-aware version.
+    def pending_approval_tasks(self) -> list[Task]:
+        """List tasks waiting for explicit operator approval.
+
+        Covers both queue states the gate can leave a task in: READY (freshly
+        stamped, not yet inspected by the swarm) and BLOCKED (flipped by the
+        swarm's BLOCKED_ON_APPROVAL defense-in-depth check).
+        """
+        pending: list[Task] = []
+        for status in (TaskStatus.READY, TaskStatus.BLOCKED):
+            for t in self._task_manager.list_tasks(status=status):
+                if t.requires_approval:
+                    pending.append(t)
+        return pending
 
     def execute_next(self) -> Any:
         """Trigger swarm execution on the next queued batch."""
@@ -391,6 +515,31 @@ class Orchestrator:
     def execute_task_now(self, task: Task) -> Any:
         """Execute one task synchronously, bypassing the queue batch."""
         return self._swarm.execute_task(task)
+
+    def submit_job(
+        self,
+        task: str,
+        provider: str,
+        account: str | None = None,
+        worker: str | None = None,
+        model: str | None = None,
+        failover_chain: list[dict[str, Any]] | None = None,
+    ) -> Job:
+        """Submit a deterministic Job to any AIProvider or AgentAdapter."""
+        return self._job_manager.submit_job(
+            task=task,
+            provider=provider,
+            account=account,
+            worker=worker,
+            model=model,
+            failover_chain=failover_chain,
+        )
+
+    def execute_job(
+        self, job: Job, failover_chain: list[dict[str, Any]] | None = None
+    ) -> Job:
+        """Execute a Job deterministically with explicit failovers."""
+        return self._job_manager.execute_job(job=job, failover_chain=failover_chain)
 
     # ------------------------------------------------------------------
     # Continue

@@ -60,11 +60,15 @@ NEXT AGENT  (brain.py continue)
 | `tasks/` | Persistent task lifecycle |
 | `sessions/` | task -> session -> conversation mapping |
 | `memory/` | Shared SQLite store + relevance retrieval |
+| `providers/mcp/` | Phase 15: Read-only MCP discovery, tool catalog, safety classification |
+| `brain/knowledge/` | Phase 15: Steering registry, precedence hierarchy, document registry, relevance |
+| `brain/resources/` | Phase 15: CLI registry, repository awareness, Universal Resource Graph |
+| `brain/context/` | Phase 15: Task context builder, auto resource selection, preview |
 | `handoffs/` | Markdown + JSON handoff records and archive |
 | `events/` | Append-only JSONL event bus |
 | `locks/` | Atomic file locks with TTL |
-| `ui/dashboard/` | Mission Control (loopback only) |
-| `tests/` | 87 unit and integration tests |
+| `ui/dashboard/` | Mission Control (loopback only) + Phase 15 MCP/Tools/Context API |
+| `tests/` | Unit and integration test suites |
 
 ## Design rules
 

@@ -19,6 +19,7 @@ task-to-conversation session mapping, and per-account telemetry.
 from __future__ import annotations
 
 import concurrent.futures
+import datetime
 import os
 import re
 import subprocess
@@ -89,7 +90,7 @@ class SwarmWorkerPool:
         self._file_locker = file_locker or FileLocker()
         self._handoff_manager = handoff_manager or HandoffManager()
         self._memory_store = memory_store or MemoryStore()
-        self._retriever = MemoryRetriever(self._memory_store)
+        self._retriever = MemoryRetriever(self._memory_store, event_bus=self._event_bus)
         self._session_manager = session_manager or SessionManager()
         self._workspace = workspace_dir or Path.cwd()
         self._max_workers = max(1, max_workers)
@@ -100,6 +101,8 @@ class SwarmWorkerPool:
         self._max_heavy_agents = max(1, MAX_HEAVY_AGENTS)
         self._active_heavy_tasks = 0
         self._heavy_lock = threading.Lock()
+        self._active_tasks: dict[str, dict[str, Any]] = {}
+        self._active_lock = threading.Lock()
 
     @property
     def token_tracker(self) -> TokenTelemetryTracker:
@@ -116,6 +119,21 @@ class SwarmWorkerPool:
     @property
     def worktrees(self) -> WorktreeManager:
         return self._worktree_manager
+
+    def get_active_task_ids(self) -> list[str]:
+        """Return task IDs of currently executing tasks."""
+        with self._active_lock:
+            return list(self._active_tasks.keys())
+
+    def get_active_tasks(self) -> dict[str, dict[str, Any]]:
+        """Return copy of metadata dict for all currently executing tasks."""
+        with self._active_lock:
+            return {k: dict(v) for k, v in self._active_tasks.items()}
+
+    def is_task_active(self, task_id: str) -> bool:
+        """Check whether a given task is currently executing."""
+        with self._active_lock:
+            return task_id in self._active_tasks
 
     # ------------------------------------------------------------------
     # Telemetry helpers
@@ -280,6 +298,34 @@ class SwarmWorkerPool:
     ) -> TaskExecutionResult:
         """Execute a single task synchronously on its assigned agent."""
         agent_id = task.assigned_agent or "antigravity-account-1"
+
+        # BUG-002 fix (defense in depth): a task flagged for operator approval
+        # must never be executed here, no matter which caller reaches this
+        # entry point (queue batch, dashboard, continuation, or direct call).
+        if getattr(task, "requires_approval", False):
+            self._task_manager.update_status(
+                task.task_id,
+                TaskStatus.BLOCKED,
+                stage="BLOCKED_ON_APPROVAL",
+                error=task.approval_reason
+                or "Task requires explicit operator approval before execution",
+            )
+            self._event_bus.publish(
+                EventType.APPROVAL_REQUIRED,
+                metadata={"blocked_tasks": [task.task_id], "source": "swarm.execute_task"},
+            )
+            return TaskExecutionResult(
+                task_id=task.task_id,
+                agent_id=agent_id,
+                account_id=task.assigned_account or "unknown",
+                provider="approval-gate",
+                success=False,
+                exit_code=1,
+                output="",
+                error="BLOCKED_ON_APPROVAL: "
+                + (task.approval_reason or "explicit operator approval required"),
+                actual_model=UNKNOWN_MODEL,
+            )
 
         # Pre-flight Phase 4A guards: check terminal states and depth/budget limits
         if task.is_terminal_state:
@@ -499,11 +545,21 @@ class SwarmWorkerPool:
                 session_id=session_id,
             )
 
+        with self._active_lock:
+            self._active_tasks[task.task_id] = {
+                "task_id": task.task_id,
+                "agent_id": agent_id,
+                "provider": adapter.provider,
+                "model": task.assigned_model,
+                "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }
+
         self._task_manager.update_status(
             task.task_id,
             TaskStatus.RUNNING,
             session_id=session_id,
             requested_model=task.assigned_model,
+            stage="MEMORY",
         )
 
         # Record the session mapping *before* execution so an interrupted run
@@ -533,6 +589,17 @@ class SwarmWorkerPool:
             task.task_id,
             session_id,
             {"requested_model": task.assigned_model},
+        )
+        self._event_bus.publish(
+            EventType.PROVIDER_STARTED,
+            agent_id=agent_id,
+            task_id=task.task_id,
+            session_id=session_id,
+            provider=adapter.provider,
+            metadata={
+                "requested_model": task.assigned_model,
+                "account_id": adapter.account_id,
+            },
         )
 
         # Acquire file locks
@@ -669,6 +736,9 @@ class SwarmWorkerPool:
                         session_id=session_id,
                     )
 
+            self._task_manager.update_status(
+                task.task_id, TaskStatus.RUNNING, stage="EXECUTION"
+            )
             self._event_bus.publish(
                 EventType.TASK_EXECUTION_STARTED,
                 agent_id=agent_id,
@@ -734,12 +804,41 @@ class SwarmWorkerPool:
                 task_type=task.task_type,
                 complexity=task.complexity,
                 success=result.success,
+                usage_source=result.usage_source,
+                started_at=result.started_at,
+                completed_at=result.completed_at,
                 raw_response=result.raw_response,
             )
 
             if result.success:
+                self._event_bus.publish(
+                    EventType.PROVIDER_COMPLETED,
+                    agent_id=agent_id,
+                    task_id=task.task_id,
+                    session_id=session_id,
+                    provider=adapter.provider,
+                    metadata={
+                        "actual_model": result.actual_model,
+                        "exit_code": result.exit_code,
+                        "duration_seconds": result.duration_seconds,
+                        "total_tokens": result.total_tokens,
+                        "usage_source": result.usage_source,
+                    },
+                )
                 self._on_success(task, adapter, agent_id, session_id, result, memory_refs, worktree_record)
             else:
+                self._event_bus.publish(
+                    EventType.PROVIDER_FAILED,
+                    agent_id=agent_id,
+                    task_id=task.task_id,
+                    session_id=session_id,
+                    provider=adapter.provider,
+                    metadata={
+                        "exit_code": result.exit_code,
+                        "error": (result.error or "")[:500],
+                        "provider_status": result.provider_status,
+                    },
+                )
                 self._emit(
                     "failed",
                     EventType.TASK_EXECUTION_FAILED,
@@ -764,24 +863,61 @@ class SwarmWorkerPool:
                 )
                 if failover_dec.should_failover and failover_dec.fallback_agent_id:
                     fallback_agent = failover_dec.fallback_agent_id
+                    fb_adapter = self._registry.get_adapter(fallback_agent)
+                    fallback_record = {
+                        "original_provider": adapter.provider,
+                        "original_agent": agent_id,
+                        "original_model": task.assigned_model,
+                        "failure": (result.error or "")[:500],
+                        "fallback_agent": fallback_agent,
+                        "fallback_provider": getattr(fb_adapter, "provider", "unknown") if fb_adapter else "unknown",
+                        "fallback_model": getattr(fb_adapter, "default_model", "auto") if fb_adapter else "auto",
+                        "fallback_timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                        "reason": failover_dec.reason,
+                    }
+                    task.result["fallback"] = fallback_record
+                    self._task_manager.update_status(
+                        task.task_id, TaskStatus.RUNNING, stage="FAILOVER"
+                    )
+                    self._event_bus.publish(
+                        EventType.FAILOVER_STARTED,
+                        agent_id=fallback_agent,
+                        task_id=task.task_id,
+                        session_id=session_id,
+                        provider=fb_adapter.provider if fb_adapter else "unknown",
+                        metadata=fallback_record,
+                    )
                     if worktree_record and not result.files_touched:
                         try:
                             self._worktree_manager.cleanup(task.task_id)
                         except Exception:
                             pass
                     task.assigned_agent = fallback_agent
-                    fb_adapter = self._registry.get_adapter(fallback_agent)
                     if fb_adapter:
                         task.assigned_account = fb_adapter.account_id
                     for lf in locked_files:
                         self._file_locker.release(lf, agent_id=agent_id)
                     locked_files.clear()
-                    return self.execute_task(task, attempted_agents=attempted + [fallback_agent])
+                    fallback_res = self.execute_task(task, attempted_agents=attempted + [fallback_agent])
+                    self._event_bus.publish(
+                        EventType.FAILOVER_COMPLETED,
+                        agent_id=fallback_agent,
+                        task_id=task.task_id,
+                        session_id=session_id,
+                        provider=fb_adapter.provider if fb_adapter else "unknown",
+                        metadata={
+                            "success": fallback_res.success,
+                            "fallback_agent": fallback_agent,
+                        },
+                    )
+                    return fallback_res
 
                 self._on_failure(task, adapter, agent_id, session_id, result, worktree_record)
 
             return result
         finally:
+            with self._active_lock:
+                self._active_tasks.pop(task.task_id, None)
             if is_heavy:
                 with self._heavy_lock:
                     self._active_heavy_tasks = max(0, self._active_heavy_tasks - 1)
@@ -949,11 +1085,21 @@ class SwarmWorkerPool:
             terminal_reason=terminal_reason,
             verification_for=task.verification_for,
         )
+        self._task_manager.update_status(task.task_id, TaskStatus.RUNNING, stage="HANDOFF")
         handoff_path = self._handoff_manager.write_handoff(record)
+        self._event_bus.publish(
+            EventType.HANDOFF_CREATED,
+            agent_id=agent_id,
+            task_id=task.task_id,
+            session_id=session_id,
+            metadata={"recommended_agent": recommended_agent, "handoff": str(handoff_path)},
+        )
 
+        stage = "COMPLETE" if final_status in (TaskStatus.COMPLETED, TaskStatus.VERIFICATION_COMPLETE) else "FAILED"
         self._task_manager.update_status(
             task.task_id,
             final_status,
+            stage=stage,
             result=result.normalized(),
             actual_model=result.actual_model,
             requested_model=task.assigned_model,
@@ -1184,6 +1330,28 @@ class SwarmWorkerPool:
     def run_queue(self) -> list[TaskExecutionResult]:
         """Execute the next batch of READY tasks with bounded concurrency."""
         ready_tasks = self._task_manager.list_tasks(status=TaskStatus.READY)
+        # BUG-002 fix (defense in depth): never auto-execute tasks flagged at
+        # dispatch time as requiring explicit operator approval (destructive
+        # instructions). The swarm re-checks the flag at pickup, so no queue
+        # consumer can bypass the Phase 18 approval gate.
+        gated = [t for t in ready_tasks if getattr(t, "requires_approval", False)]
+        for t in gated:
+            self._task_manager.update_status(
+                t.task_id,
+                TaskStatus.BLOCKED,
+                stage="BLOCKED_ON_APPROVAL",
+                error=t.approval_reason
+                or "Task requires explicit operator approval before execution",
+            )
+        if gated:
+            self._event_bus.publish(
+                EventType.APPROVAL_REQUIRED,
+                metadata={
+                    "blocked_tasks": [t.task_id for t in gated],
+                    "source": "swarm.run_queue",
+                },
+            )
+        ready_tasks = [t for t in ready_tasks if not getattr(t, "requires_approval", False)]
         if not ready_tasks:
             return []
 

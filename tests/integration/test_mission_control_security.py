@@ -23,9 +23,18 @@ class TestMissionControlSecurity(unittest.TestCase):
         cls._tmp_dir = tempfile.TemporaryDirectory()
         cls._orig_tm = dashboard.task_manager
         cls._orig_orch_tm = dashboard.orchestrator._task_manager
+        cls._orig_swarm_tm = dashboard.orchestrator._swarm._task_manager
         cls._test_tm = TaskManager(root_tasks_dir=Path(cls._tmp_dir.name) / "tasks")
         dashboard.task_manager = cls._test_tm
         dashboard.orchestrator._task_manager = cls._test_tm
+        # The swarm holds its own TaskManager reference and is the component
+        # that actually executes queued tasks (BUG-003 fix): without swapping
+        # it too, a background execute_next() thread would drain the repo queue.
+        dashboard.orchestrator._swarm._task_manager = cls._test_tm
+        # Pin the bearer token via env so tests never read/write the repo's
+        # runtime/mission_control.token file.
+        cls._orig_token_env = os.environ.get("MISSION_CONTROL_AUTH_TOKEN")
+        os.environ["MISSION_CONTROL_AUTH_TOKEN"] = "test-suite-token-isolation-0123456789"
 
         # Bind ephemeral loopback port for testing
         cls.server = dashboard.ThreadedHTTPServer(
@@ -42,6 +51,11 @@ class TestMissionControlSecurity(unittest.TestCase):
         cls.server.server_close()
         dashboard.task_manager = cls._orig_tm
         dashboard.orchestrator._task_manager = cls._orig_orch_tm
+        dashboard.orchestrator._swarm._task_manager = cls._orig_swarm_tm
+        if cls._orig_token_env is None:
+            os.environ.pop("MISSION_CONTROL_AUTH_TOKEN", None)
+        else:
+            os.environ["MISSION_CONTROL_AUTH_TOKEN"] = cls._orig_token_env
         cls._tmp_dir.cleanup()
 
     def _request(
@@ -174,7 +188,7 @@ class TestMissionControlSecurity(unittest.TestCase):
         self.assertEqual(body.get("status"), "created")
         self.assertIn("task", body)
 
-        recent = dashboard.event_bus.get_recent_events(10)
+        recent = dashboard.event_bus.get_recent_events(50)
         auth_successes = [e for e in recent if e.event_type == EventType.AUTH_SUCCESS]
         self.assertTrue(len(auth_successes) > 0)
 

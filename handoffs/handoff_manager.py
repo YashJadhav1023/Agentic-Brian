@@ -172,3 +172,44 @@ class HandoffManager:
             reverse=True,
         )
         return files[:limit]
+
+    def list_history(self, limit: int = 50) -> list[dict[str, Any]]:
+        """List historical handoffs from archive and current handoff, newest first."""
+        records: list[dict[str, Any]] = []
+        current = self.get_current_record()
+        if current:
+            d = current.to_dict()
+            d["is_current"] = True
+            d["filename"] = "current.json"
+            records.append(d)
+
+        json_files = sorted(
+            self._archive_dir.glob("handoff_*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for p in json_files:
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                data["is_current"] = False
+                data["filename"] = p.name
+                records.append(data)
+            except Exception:
+                continue
+            if len(records) >= limit:
+                break
+
+        return records[:limit]
+
+    def get_record_by_name(self, filename: str) -> dict[str, Any] | None:
+        """Get specific handoff record by filename ('current.json' or 'handoff_...json')."""
+        if filename == "current.json":
+            rec = self.get_current_record()
+            return rec.to_dict() if rec else None
+        target = self._archive_dir / filename
+        if target.is_file() and target.name.endswith(".json"):
+            try:
+                return json.loads(target.read_text(encoding="utf-8"))
+            except Exception:
+                return None
+        return None

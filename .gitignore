@@ -24,16 +24,10 @@ secrets*
 creds*
 
 # Runtime data & locks (ephemeral state)
-runtime/logs/*
-!runtime/logs/.gitkeep
-runtime/cache/*
-!runtime/cache/.gitkeep
-runtime/temporary/*
-!runtime/temporary/.gitkeep
-runtime/sandboxes/*
-!runtime/sandboxes/.gitkeep
-runtime/*.token
-*.token
+runtime/*
+!runtime/**/.gitkeep
+!runtime/.gitkeep
+.agents/
 locks/*.lock
 locks/*.json
 !locks/.gitkeep
@@ -57,6 +51,9 @@ tasks/completed/*.json
 tasks/failed/*.json
 handoffs/archive/*.md
 handoffs/archive/*.json
+
+# Manual pre-edit config snapshots (operator artifacts, not source)
+backups/
 
 # Local user configs & OS caches
 .DS_Store

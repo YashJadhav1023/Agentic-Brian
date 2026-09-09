@@ -163,7 +163,7 @@ class TestAgentSandboxes(unittest.TestCase):
         self.assertTrue((Path(rec.path) / "acc2_refactor.py").exists())
 
         # Verify Account 2 profile flag preserved
-        self.assertIn("--app_data_dir=antigravity-ide", runner.invoked_argv)
+        self.assertIn("--app_data_dir=antigravity-account-3", runner.invoked_argv)
 
     def test_kiro_executes_mutating_task_in_isolated_worktree(self):
         runner = MockRunner(mutate_file="kiro_build.log", file_content="Build completed successfully\n")
@@ -201,10 +201,18 @@ class TestAgentSandboxes(unittest.TestCase):
             instruction="Modify styles and create style.css in frontend",
             preferred_agent="cline",
         )
-        self.assertEqual(task.assigned_agent, "cline")
+        # BUG-005: the "cline" preference resolves to an isolated cline account.
+        self.assertTrue(
+            task.assigned_agent.startswith("cline-account-"),
+            f"expected a cline account, got {task.assigned_agent}",
+        )
 
         with mock.patch("agents.cline.adapter.subprocess.run", runner):
-            with mock.patch.object(self.orchestrator.registry.get_adapter("cline"), "_resolve_executable", return_value="/mock/cline"):
+            with mock.patch.object(
+                self.orchestrator.registry.get_adapter(task.assigned_agent),
+                "_resolve_executable",
+                return_value="/mock/cline",
+            ):
                 results = self.orchestrator.execute_next()
 
         self.assertEqual(len(results), 1)

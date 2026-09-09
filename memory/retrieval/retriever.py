@@ -10,14 +10,16 @@ import re
 import sqlite3
 from typing import Any
 
+from events.bus import EventBus, EventType
 from memory.store.memory_store import MemoryEntry, MemoryScope, MemoryStore
 
 
 class MemoryRetriever:
     """Intelligent context retrieval for prompts."""
 
-    def __init__(self, store: MemoryStore) -> None:
+    def __init__(self, store: MemoryStore, event_bus: EventBus | None = None) -> None:
         self._store = store
+        self._event_bus = event_bus
 
     def retrieve_context(
         self,
@@ -28,8 +30,21 @@ class MemoryRetriever:
         max_bytes: int = 2048,
     ) -> list[MemoryEntry]:
         """Retrieve top relevant memories matching query within byte budget."""
+        if self._event_bus:
+            self._event_bus.publish(
+                EventType.MEMORY_RETRIEVAL_STARTED,
+                task_id=task_id,
+                metadata={"query": query[:200], "scope": scope.value if scope else "all"},
+            )
+
         all_memories = self._store.list_all(limit=200)
         if not all_memories:
+            if self._event_bus:
+                self._event_bus.publish(
+                    EventType.MEMORY_RETRIEVAL_COMPLETED,
+                    task_id=task_id,
+                    metadata={"query": query[:200], "retrieved_count": 0, "retrieved": []},
+                )
             return []
 
         tokens = set(re.findall(r"\w{3,}", query.lower()))
@@ -70,12 +85,14 @@ class MemoryRetriever:
 
             # Recency decay: newer memories get higher freshness multiplier
             try:
-                mem_time = datetime.datetime.fromisoformat(mem.timestamp)
-                if mem_time.tzinfo is None:
-                    mem_time = mem_time.replace(tzinfo=datetime.timezone.utc)
-                age_hours = max(0.0, (now - mem_time).total_seconds() / 3600.0)
-                recency_multiplier = max(0.5, 1.5 - min(1.0, age_hours / 72.0))
-                score *= recency_multiplier
+                mem_time_str = getattr(mem, "created_at", getattr(mem, "timestamp", None))
+                if mem_time_str:
+                    mem_time = datetime.datetime.fromisoformat(mem_time_str)
+                    if mem_time.tzinfo is None:
+                        mem_time = mem_time.replace(tzinfo=datetime.timezone.utc)
+                    age_hours = max(0.0, (now - mem_time).total_seconds() / 3600.0)
+                    recency_multiplier = max(0.5, 1.5 - min(1.0, age_hours / 72.0))
+                    score *= recency_multiplier
             except Exception:
                 pass
 
@@ -85,6 +102,7 @@ class MemoryRetriever:
 
         selected: list[MemoryEntry] = []
         accumulated_bytes = 0
+        retrieval_metadata: list[dict[str, Any]] = []
 
         for score, mem in scored[:max_items]:
             entry_bytes = len(mem.content.encode("utf-8"))
@@ -92,6 +110,35 @@ class MemoryRetriever:
                 break
             selected.append(mem)
             accumulated_bytes += entry_bytes
+            retrieval_metadata.append({
+                "memory_id": mem.memory_id,
+                "score": round(score, 2),
+                "scope": mem.scope.value,
+                "importance": mem.importance,
+            })
+            if hasattr(self._store, "record_retrieval"):
+                try:
+                    self._store.record_retrieval(
+                        query=query,
+                        retrieved_memory_id=mem.memory_id,
+                        retrieval_score=score,
+                        task_id=task_id,
+                        agent_id=mem.source_agent,
+                    )
+                except Exception:
+                    pass
+
+        if self._event_bus:
+            self._event_bus.publish(
+                EventType.MEMORY_RETRIEVAL_COMPLETED,
+                task_id=task_id,
+                metadata={
+                    "query": query[:200],
+                    "count": len(selected),
+                    "retrieved_count": len(selected),
+                    "retrieved": retrieval_metadata,
+                },
+            )
 
         return selected
 

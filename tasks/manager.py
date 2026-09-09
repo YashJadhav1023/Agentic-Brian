@@ -71,12 +71,18 @@ class Task:
     requested_model: str | None = None
     # Phase 4A Continuation & Verification Contract
     task_type: str = "general"               # "general", "verification", "remediation"
+    # Phase 18 approval gate: destructive/high-risk instructions are stamped at
+    # dispatch time (BUG-002 fix) and must be explicitly approved before the
+    # swarm may execute them.
+    requires_approval: bool = False
+    approval_reason: str | None = None
     continuation_depth: int = 0
     max_continuation_depth: int = 5
     verification_depth: int = 0
     max_verification_depth: int = 1
     continuation_budget: int = 5
     verification_for: str | None = None      # ID of task this task verifies
+    stage: str = "QUEUED"
     is_terminal: bool = False
     terminal_reason: str | None = None
 
@@ -100,6 +106,15 @@ class Task:
         d = asdict(self)
         d["status"] = self.status.value
         d["priority"] = self.priority.value
+        if self.started_at and self.status == TaskStatus.RUNNING:
+            try:
+                t0 = datetime.datetime.fromisoformat(self.started_at)
+                t_now = datetime.datetime.now(datetime.timezone.utc)
+                d["elapsed_seconds"] = max(0.0, (t_now - t0).total_seconds())
+            except Exception:
+                d["elapsed_seconds"] = self.duration_seconds
+        else:
+            d["elapsed_seconds"] = self.duration_seconds
         return d
 
     @classmethod
@@ -157,6 +172,8 @@ class TaskManager:
         verification_for: str | None = None,
         is_terminal: bool = False,
         terminal_reason: str | None = None,
+        requires_approval: bool = False,
+        approval_reason: str | None = None,
     ) -> Task:
         t_id = task_id or f"task-{uuid.uuid4().hex[:8]}"
         task = Task(
@@ -180,6 +197,8 @@ class TaskManager:
             verification_for=verification_for,
             is_terminal=is_terminal,
             terminal_reason=terminal_reason,
+            requires_approval=requires_approval,
+            approval_reason=approval_reason,
         )
         self.save_task(task)
         return task
@@ -230,6 +249,7 @@ class TaskManager:
         verification_depth: int | None = None,
         continuation_budget: int | None = None,
         verification_for: str | None = None,
+        stage: str | None = None,
     ) -> Task | None:
         task = self.get_task(task_id)
         if not task:
@@ -237,6 +257,23 @@ class TaskManager:
 
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         task.status = status
+
+        if stage is not None:
+            task.stage = stage
+        elif status == TaskStatus.READY:
+            task.stage = "QUEUED"
+        elif status == TaskStatus.RUNNING and task.stage in ("QUEUED", "PLANNING"):
+            task.stage = "EXECUTION"
+        elif status in (TaskStatus.COMPLETED, TaskStatus.VERIFICATION_COMPLETE):
+            task.stage = "COMPLETE"
+        elif status in (
+            TaskStatus.FAILED,
+            TaskStatus.DEPTH_LIMIT_REACHED,
+            TaskStatus.BUDGET_EXHAUSTED,
+            TaskStatus.REJECTED,
+            TaskStatus.CANCELLED,
+        ):
+            task.stage = "FAILED"
 
         if status == TaskStatus.RUNNING and not task.started_at:
             task.started_at = now
@@ -342,3 +379,90 @@ class TaskManager:
             except Exception:
                 pass
         return count
+
+    def reconcile_runtime_state(
+        self, active_task_ids: set[str] | list[str] | None = None
+    ) -> dict[str, int]:
+        active_ids = set(active_task_ids or [])
+        checked = 0
+        still_running = 0
+        completed = 0
+        failed = 0
+        recovered = 0
+
+        # Scan all JSON records in the active/ directory
+        for p in list(self._dir_active.glob("*.json")):
+            checked += 1
+            try:
+                task = Task.from_dict(json.loads(p.read_text(encoding="utf-8")))
+            except Exception:
+                continue
+
+            # CASE A: Real worker thread or process is actively running in the swarm
+            if task.task_id in active_ids:
+                still_running += 1
+                continue
+
+            # Process is not alive in the active worker pool. Reconcile based on records:
+            has_success_result = bool(task.result and task.result.get("success") is True)
+            has_handoff = bool(task.handoffs and len(task.handoffs) > 0)
+            has_errors = bool(task.errors and len(task.errors) > 0)
+
+            # CASE B: Successful result exists or completed handoff exists without errors
+            if has_success_result or (has_handoff and not has_errors):
+                task.status = TaskStatus.COMPLETED
+                task.stage = "COMPLETE"
+                task.is_terminal = True
+                task.terminal_reason = "COMPLETED"
+                if not task.completed_at:
+                    task.completed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                self.save_task(task)
+                completed += 1
+            # CASE C: Explicit failure recorded
+            elif bool(task.result and task.result.get("success") is False) or has_errors:
+                task.status = TaskStatus.FAILED
+                task.stage = "FAILED"
+                task.is_terminal = True
+                task.terminal_reason = "FAILED"
+                if not task.completed_at:
+                    task.completed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                self.save_task(task)
+                failed += 1
+            # CASE D & E: Process is dead / vanished with no result
+            else:
+                task.status = TaskStatus.FAILED
+                task.stage = "FAILED"
+                task.is_terminal = True
+                task.terminal_reason = "PROCESS_TERMINATED"
+                task.errors.append(
+                    "Process terminated or system restarted before task completed (recovered by runtime reconciler)"
+                )
+                if not task.completed_at:
+                    task.completed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                self.save_task(task)
+                recovered += 1
+
+        # Emit TASK_RECONCILED summary event if any tasks were reconciled
+        try:
+            from events.bus import event_bus, EventType
+            if completed or failed or recovered:
+                event_bus.publish(
+                    EventType.TASK_RECONCILED,
+                    metadata={
+                        "checked": checked,
+                        "still_running": still_running,
+                        "completed": completed,
+                        "failed": failed,
+                        "recovered": recovered,
+                    },
+                )
+        except Exception:
+            pass
+
+        return {
+            "checked": checked,
+            "still_running": still_running,
+            "completed": completed,
+            "failed": failed,
+            "recovered": recovered,
+        }

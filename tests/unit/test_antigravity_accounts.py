@@ -1,10 +1,11 @@
-"""Antigravity Account 1 & 2: discovery, isolation, command construction, parsing."""
+"""Antigravity Accounts: discovery, isolation, command construction, parsing."""
 import json
 import unittest
 from pathlib import Path
 
 from agents.antigravity.account1.adapter import AntigravityAccount1Adapter
 from agents.antigravity.account2.adapter import AntigravityAccount2Adapter
+from agents.antigravity.account3.adapter import AntigravityAccount3Adapter
 from agents.antigravity.adapter import (
     DEFAULT_CONFIG_PATH,
     AntigravityAccountAdapter,
@@ -14,19 +15,21 @@ from agents.base.adapter import UNKNOWN_MODEL, AgentStatus, Capability, Executio
 
 
 class TestAntigravityDiscovery(unittest.TestCase):
-    """Requirement: Account 2 discovery."""
+    """Requirement: All 3 accounts discovery."""
 
-    def test_both_accounts_discovered_from_config(self):
+    def test_all_accounts_discovered_from_config(self):
         adapters = AntigravityAdapter.load_from_config()
         ids = sorted(a.agent_id for a in adapters)
-        self.assertEqual(ids, ["antigravity-account-1", "antigravity-account-2"])
+        self.assertEqual(ids, ["antigravity-account-1", "antigravity-account-2", "antigravity-account-3"])
 
     def test_config_is_the_single_source_of_truth(self):
         self.assertTrue(DEFAULT_CONFIG_PATH.is_file())
         data = json.loads(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
-        account2 = data["providers"]["antigravity"]["accounts"]["antigravity-account-2"]
-        self.assertEqual(account2["execution"]["app_data_dir"], "antigravity-ide")
-        self.assertEqual(account2["execution"]["output_format"], "json")
+        accounts = data["providers"]["antigravity"]["accounts"]
+        self.assertEqual(accounts["antigravity-account-1"]["execution"]["app_data_dir"], "antigravity-account-jadhav")
+        self.assertEqual(accounts["antigravity-account-2"]["execution"]["app_data_dir"], "antigravity-account-3")
+        self.assertEqual(accounts["antigravity-account-3"]["execution"]["app_data_dir"], "antigravity-account-yash")
+        self.assertEqual(accounts["antigravity-account-2"]["execution"]["output_format"], "json")
 
     def test_missing_account_raises_rather_than_defaulting(self):
         with self.assertRaises(RuntimeError):
@@ -38,35 +41,44 @@ class TestAntigravityAccounts(unittest.TestCase):
     def setUp(self):
         self.a1 = AntigravityAccount1Adapter()
         self.a2 = AntigravityAccount2Adapter()
+        self.a3 = AntigravityAccount3Adapter()
 
     def test_account_isolation(self):
         """Requirement: account isolation. Profiles must never be shared."""
         self.assertEqual(self.a1.agent_id, "antigravity-account-1")
         self.assertEqual(self.a2.agent_id, "antigravity-account-2")
+        self.assertEqual(self.a3.agent_id, "antigravity-account-3")
         self.assertEqual(self.a1.account_id, "account-1")
         self.assertEqual(self.a2.account_id, "account-2")
-        self.assertEqual(self.a1.data_dir, "antigravity-cli")
-        self.assertEqual(self.a2.data_dir, "antigravity-ide")
-        self.assertNotEqual(self.a1.data_dir, self.a2.data_dir)
-        self.assertNotEqual(self.a1.profile_dir, self.a2.profile_dir)
-        self.assertTrue(str(self.a2.profile_dir).endswith("antigravity-ide"))
+        self.assertEqual(self.a3.account_id, "account-3")
+        self.assertEqual(self.a1.data_dir, "antigravity-account-jadhav")
+        self.assertEqual(self.a2.data_dir, "antigravity-account-3")
+        self.assertEqual(self.a3.data_dir, "antigravity-account-yash")
+        dirs = {self.a1.data_dir, self.a2.data_dir, self.a3.data_dir}
+        self.assertEqual(len(dirs), 3)
+        profiles = {self.a1.profile_dir, self.a2.profile_dir, self.a3.profile_dir}
+        self.assertEqual(len(profiles), 3)
 
-    def test_both_accounts_are_headless(self):
+    def test_all_accounts_are_headless(self):
         self.assertEqual(self.a1.execution_mode, ExecutionMode.HEADLESS)
         self.assertEqual(self.a2.execution_mode, ExecutionMode.HEADLESS)
+        self.assertEqual(self.a3.execution_mode, ExecutionMode.HEADLESS)
 
-    def test_account2_capabilities_include_refactoring_and_review(self):
-        caps = self.a2.capabilities()
-        self.assertIn(Capability.COMPONENT_REFACTORING, caps)
-        self.assertIn(Capability.CODE_REVIEW, caps)
+    def test_account_capabilities(self):
+        caps2 = self.a2.capabilities()
+        self.assertIn(Capability.COMPONENT_REFACTORING, caps2)
+        self.assertIn(Capability.CODE_REVIEW, caps2)
+        caps3 = self.a3.capabilities()
+        self.assertIn(Capability.DEEP_REASONING, caps3)
 
     def test_health_checks(self):
-        """Requirement: Account 2 health (lightweight, no model spend)."""
+        """Requirement: Account health (lightweight, no model spend)."""
         ok1, reason1 = self.a1.health()
         self.assertTrue(ok1, f"Account 1 unhealthy: {reason1}")
         ok2, reason2 = self.a2.health()
         self.assertTrue(ok2, f"Account 2 unhealthy: {reason2}")
-        self.assertIn("antigravity-ide", reason2)
+        ok3, reason3 = self.a3.health()
+        self.assertTrue(ok3, f"Account 3 unhealthy: {reason3}")
 
     def test_status_and_cancel(self):
         self.assertEqual(self.a2.status(), AgentStatus.IDLE)
@@ -91,7 +103,7 @@ class TestCommandConstruction(unittest.TestCase):
 
     def test_app_data_dir_always_present(self):
         argv = self.a2._base_argv(skip_permissions=False)
-        self.assertIn("--app_data_dir=antigravity-ide", argv)
+        self.assertIn("--app_data_dir=antigravity-account-3", argv)
         self.assertIn("--output-format", argv)
         self.assertIn("json", argv)
 

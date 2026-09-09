@@ -18,6 +18,7 @@ class AgentTarget(str, Enum):
     CLINE = "cline"
     ANTIGRAVITY_ACCOUNT_1 = "antigravity-account-1"
     ANTIGRAVITY_ACCOUNT_2 = "antigravity-account-2"
+    ANTIGRAVITY_ACCOUNT_3 = "antigravity-account-3"
     # Backwards compatibility aliases
     ANTIGRAVITY = "antigravity"
     ANTIGRAVITY_IDE = "antigravity-ide"
@@ -88,10 +89,9 @@ KIRO_CATALOG: tuple[ModelSpec, ...] = (
 )
 
 # Cline CLI Catalog.
-# The Cline CLI does not expose a model listing, and its model selection is bound
-# to the configured provider account. Nothing beyond `auto` has been verified, so
-# nothing beyond `auto` is offered — an unverified model id is worse than none.
+# Live verified models from Cline CLI and providers.json:
 CLINE_CATALOG: tuple[ModelSpec, ...] = (
+    ModelSpec("deepseek/deepseek-v4-flash", AgentTarget.CLINE, ModelTier.BALANCED, 3, 1_048_576, Specialization.GENERAL, False),
     ModelSpec("auto", AgentTarget.CLINE, ModelTier.AUTO, 3, 0, Specialization.GENERAL, False),
 )
 
@@ -137,6 +137,13 @@ ANTIGRAVITY_ACCOUNT_2_CATALOG: tuple[ModelSpec, ...] = (
     ModelSpec("gemini-3.6-flash-low", AgentTarget.ANTIGRAVITY_ACCOUNT_2, ModelTier.FAST, 2, 1_000_000, Specialization.GENERAL, True),
 )
 
+# Antigravity Account 3 Catalog.
+# Enumerated live: `agy --app_data_dir=antigravity-account-yash models`.
+ANTIGRAVITY_ACCOUNT_3_CATALOG: tuple[ModelSpec, ...] = tuple(
+    ModelSpec(spec.name, AgentTarget.ANTIGRAVITY_ACCOUNT_3, spec.tier, spec.strength, spec.context_tokens, spec.specialization, spec.supports_effort)
+    for spec in ANTIGRAVITY_ACCOUNT_1_CATALOG
+)
+
 AGENT_CATALOGS: dict[str, tuple[ModelSpec, ...]] = {
     AgentTarget.KIRO_CLI.value: KIRO_CATALOG,
     AgentTarget.CLINE.value: CLINE_CATALOG,
@@ -144,6 +151,7 @@ AGENT_CATALOGS: dict[str, tuple[ModelSpec, ...]] = {
     AgentTarget.ANTIGRAVITY.value: ANTIGRAVITY_ACCOUNT_1_CATALOG,
     AgentTarget.ANTIGRAVITY_ACCOUNT_2.value: ANTIGRAVITY_ACCOUNT_2_CATALOG,
     AgentTarget.ANTIGRAVITY_IDE.value: ANTIGRAVITY_ACCOUNT_2_CATALOG,
+    AgentTarget.ANTIGRAVITY_ACCOUNT_3.value: ANTIGRAVITY_ACCOUNT_3_CATALOG,
 }
 
 
@@ -238,11 +246,19 @@ def verify_actual_model(response_payload: dict[str, Any] | str, requested_model:
             val = response_payload.get(key)
             if isinstance(val, str) and val.strip():
                 return val.strip()
+            if isinstance(val, dict):
+                mid = val.get("id") or val.get("name")
+                if isinstance(mid, str) and mid.strip():
+                    return mid.strip()
         raw_resp = response_payload.get("raw_response")
         if isinstance(raw_resp, dict):
             for key in ("model", "model_version", "model_name"):
                 val = raw_resp.get(key)
                 if isinstance(val, str) and val.strip():
                     return val.strip()
+                if isinstance(val, dict):
+                    mid = val.get("id") or val.get("name")
+                    if isinstance(mid, str) and mid.strip():
+                        return mid.strip()
 
     return UNKNOWN_MODEL

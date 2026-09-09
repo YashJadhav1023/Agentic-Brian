@@ -144,8 +144,8 @@ class TestAccount2Execution(Account2PipelineTestCase):
             self.orchestrator.execute_next()
 
         argv = runner.last
-        self.assertIn("--app_data_dir=antigravity-ide", argv)
-        self.assertNotIn("--app_data_dir=antigravity-cli", argv)
+        self.assertIn("--app_data_dir=antigravity-account-3", argv)
+        self.assertNotIn("--app_data_dir=antigravity-account-jadhav", argv)
         self.assertNotIn("--dangerously-skip-permissions", argv)
         self.assertIn("--output-format", argv)
 

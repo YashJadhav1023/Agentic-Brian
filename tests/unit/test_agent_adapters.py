@@ -15,19 +15,27 @@ class TestAgentAdapters(unittest.TestCase):
         agent_ids = {a.agent_id for a in self.registry.list_active_adapters()}
         self.assertIn("antigravity-account-1", agent_ids)
         self.assertIn("antigravity-account-2", agent_ids)
+        self.assertIn("antigravity-account-3", agent_ids)
         self.assertIn("kiro-cli", agent_ids)
-        self.assertIn("cline", agent_ids)
+        # BUG-005: cline registers as three isolated accounts, not a single
+        # collapsed "cline" identity.
+        self.assertIn("cline-account-1", agent_ids)
+        self.assertIn("cline-account-2", agent_ids)
+        self.assertIn("cline-account-3", agent_ids)
         self.assertNotIn("gemini-api", agent_ids)
 
     def test_account_isolation(self):
         a1 = self.registry.get_adapter("antigravity-account-1")
         a2 = self.registry.get_adapter("antigravity-account-2")
+        a3 = self.registry.get_adapter("antigravity-account-3")
         self.assertIsNotNone(a1)
         self.assertIsNotNone(a2)
+        self.assertIsNotNone(a3)
         self.assertNotEqual(a1.agent_id, a2.agent_id)
-        self.assertNotEqual(a1.account_id, a2.account_id)
-        self.assertEqual(a1.data_dir, "antigravity-cli")
-        self.assertEqual(a2.data_dir, "antigravity-ide")
+        self.assertNotEqual(a2.agent_id, a3.agent_id)
+        self.assertEqual(a1.data_dir, "antigravity-account-jadhav")
+        self.assertEqual(a2.data_dir, "antigravity-account-3")
+        self.assertEqual(a3.data_dir, "antigravity-account-yash")
 
     def test_capabilities_declaration(self):
         a1 = self.registry.get_adapter("antigravity-account-1")
@@ -46,25 +54,30 @@ class TestAgentAdapters(unittest.TestCase):
             self.assertEqual(described["agent_id"], adapter.agent_id)
             self.assertIn("health", described)
 
-    def test_registry_serialization_exposes_account2(self):
-        """Requirement: Mission Control must see Account 2 as a real agent."""
+    def test_registry_serialization_exposes_account2_and_account3(self):
+        """Requirement: Mission Control must see Account 2 & 3 as real agents."""
         data = self.registry.to_dict()
         accounts = data["antigravity"]["accounts"]
         self.assertIn("antigravity-account-2", accounts)
-        entry = accounts["antigravity-account-2"]
-        self.assertTrue(entry["healthy"])
-        self.assertEqual(entry["account_id"], "account-2")
-        self.assertIn("antigravity-ide", entry["profile"])
+        self.assertIn("antigravity-account-3", accounts)
+        entry2 = accounts["antigravity-account-2"]
+        self.assertTrue(entry2["healthy"])
+        self.assertEqual(entry2["account_id"], "account-2")
+        self.assertIn("antigravity-account-3", entry2["profile"])
+        entry3 = accounts["antigravity-account-3"]
+        self.assertTrue(entry3["healthy"])
+        self.assertEqual(entry3["account_id"], "account-3")
+        self.assertIn("antigravity-account-yash", entry3["profile"])
 
 
 class TestProviderConfig(unittest.TestCase):
 
     def test_accounts_load_from_config(self):
         accounts = {a.agent_id for a in get_accounts("antigravity")}
-        self.assertEqual(accounts, {"antigravity-account-1", "antigravity-account-2"})
+        self.assertEqual(accounts, {"antigravity-account-1", "antigravity-account-2", "antigravity-account-3"})
 
     def test_bounded_concurrency_for_this_host(self):
-        self.assertEqual(max_concurrent_agents(), 2)
+        self.assertEqual(max_concurrent_agents(), 3)
 
 
 if __name__ == "__main__":

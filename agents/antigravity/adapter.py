@@ -183,6 +183,17 @@ class AntigravityAccountAdapter(AgentAdapter):
                 skip_next = True
         return safe
 
+    def _subprocess_env(self) -> dict[str, str]:
+        """Subprocess environment with GNOME Keyring shielding.
+
+        Point DBUS_SESSION_BUS_ADDRESS to /dev/null so the CLI is forced to use
+        its isolated per-profile antigravity-oauth-token and never accesses
+        or mutates the system GNOME Keyring.
+        """
+        env = os.environ.copy()
+        env["DBUS_SESSION_BUS_ADDRESS"] = "/dev/null"
+        return env
+
     # ------------------------------------------------------------------
     # Health
     # ------------------------------------------------------------------
@@ -231,7 +242,7 @@ class AntigravityAccountAdapter(AgentAdapter):
                 capture_output=True,
                 text=True,
                 timeout=90,
-                env=os.environ.copy(),
+                env=self._subprocess_env(),
             )
         except subprocess.TimeoutExpired:
             return False, "Session probe timed out after 90s"
@@ -274,7 +285,7 @@ class AntigravityAccountAdapter(AgentAdapter):
                 capture_output=True,
                 text=True,
                 timeout=90,
-                env=os.environ.copy(),
+                env=self._subprocess_env(),
             )
         except Exception:
             return ()
@@ -294,6 +305,8 @@ class AntigravityAccountAdapter(AgentAdapter):
         duration: float = 0.0,
         command: list[str] | None = None,
         stderr: str = "",
+        started_at: str | None = None,
+        completed_at: str | None = None,
     ) -> TaskExecutionResult:
         return TaskExecutionResult(
             task_id=task_id,
@@ -309,6 +322,12 @@ class AntigravityAccountAdapter(AgentAdapter):
             duration_seconds=duration,
             command=command or [],
             raw_stderr=stderr,
+            input_tokens=None,
+            output_tokens=None,
+            total_tokens=None,
+            usage_source="unknown",
+            started_at=started_at,
+            completed_at=completed_at,
         )
 
     def _parse_payload(self, stdout: str) -> tuple[dict[str, Any], bool]:
@@ -347,6 +366,8 @@ class AntigravityAccountAdapter(AgentAdapter):
         argv: list[str],
         session_id: str | None,
         fallback_conversation_id: str | None,
+        started_at: str | None = None,
+        completed_at: str | None = None,
     ) -> TaskExecutionResult:
         payload, json_valid = self._parse_payload(stdout)
         usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
@@ -392,6 +413,11 @@ class AntigravityAccountAdapter(AgentAdapter):
             )
 
         provider_duration = payload.get("duration_seconds")
+        has_usage = bool(usage) and any(usage.get(k) is not None for k in ("input_tokens", "output_tokens", "total_tokens"))
+        in_tok = int(usage["input_tokens"]) if usage.get("input_tokens") is not None else None
+        out_tok = int(usage["output_tokens"]) if usage.get("output_tokens") is not None else None
+        tot_tok = int(usage["total_tokens"]) if usage.get("total_tokens") is not None else None
+        usage_source = "reported" if has_usage else "unknown"
 
         return TaskExecutionResult(
             task_id=task_id,
@@ -407,9 +433,10 @@ class AntigravityAccountAdapter(AgentAdapter):
             # model when the provider actually names one.
             actual_model=self._extract_actual_model(payload),
             duration_seconds=duration,
-            input_tokens=int(usage.get("input_tokens") or 0),
-            output_tokens=int(usage.get("output_tokens") or 0),
-            total_tokens=int(usage.get("total_tokens") or 0),
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            total_tokens=tot_tok,
+            usage_source=usage_source,
             thinking_tokens=int(usage.get("thinking_tokens") or 0),
             cache_read_tokens=int(usage.get("cache_read_tokens") or 0),
             num_turns=int(payload.get("num_turns") or 0),
@@ -422,6 +449,8 @@ class AntigravityAccountAdapter(AgentAdapter):
             raw_stdout=stdout,
             raw_stderr=stderr,
             command=self._redact_argv(argv),
+            started_at=started_at,
+            completed_at=completed_at,
         )
 
     @staticmethod
@@ -470,6 +499,8 @@ class AntigravityAccountAdapter(AgentAdapter):
         self._current_status = AgentStatus.WORKING
         self._current_task_id = task_id
         started = time.time()
+        import datetime
+        started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         try:
             proc = subprocess.run(
                 argv,
@@ -477,10 +508,11 @@ class AntigravityAccountAdapter(AgentAdapter):
                 text=True,
                 timeout=timeout,
                 cwd=str(work_dir or Path.cwd()),
-                env=os.environ.copy(),
+                env=self._subprocess_env(),
             )
         except subprocess.TimeoutExpired:
             self._current_status = AgentStatus.FAILED
+            completed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
             return self._failure(
                 task_id,
                 f"Execution timed out after {timeout} seconds",
@@ -488,17 +520,23 @@ class AntigravityAccountAdapter(AgentAdapter):
                 requested_model=requested_model,
                 duration=time.time() - started,
                 command=self._redact_argv(argv),
+                started_at=started_at,
+                completed_at=completed_at,
             )
         except Exception as exc:
             self._current_status = AgentStatus.FAILED
+            completed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
             return self._failure(
                 task_id,
                 str(exc),
                 requested_model=requested_model,
                 duration=time.time() - started,
                 command=self._redact_argv(argv),
+                started_at=started_at,
+                completed_at=completed_at,
             )
 
+        completed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         result = self._normalize(
             task_id=task_id,
             proc_returncode=proc.returncode,
@@ -509,6 +547,8 @@ class AntigravityAccountAdapter(AgentAdapter):
             argv=argv,
             session_id=session_id,
             fallback_conversation_id=conversation_id,
+            started_at=started_at,
+            completed_at=completed_at,
         )
         self._current_status = AgentStatus.IDLE if result.success else AgentStatus.FAILED
         self._current_task_id = None
@@ -591,7 +631,7 @@ class AntigravityAccountAdapter(AgentAdapter):
                 stderr=subprocess.PIPE,
                 text=True,
                 cwd=str(work_dir or Path.cwd()),
-                env=os.environ.copy(),
+                env=self._subprocess_env(),
             )
             assert proc.stdout is not None
             for line in proc.stdout:

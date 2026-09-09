@@ -10,7 +10,7 @@ flag, a profile path or a model id.
 {
   "providers": {
     "antigravity": {
-      "command": "/home/setoo/.gemini/bin/agy",
+      "command": "~/.gemini/bin/agy",
       "profile_root": "~/.gemini",
       "accounts": {
         "antigravity-account-2": {

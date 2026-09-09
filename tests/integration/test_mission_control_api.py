@@ -54,7 +54,7 @@ class TestMissionControlApi(unittest.TestCase):
 
         self.assertEqual(entry["account_id"], "account-2")
         self.assertEqual(entry["execution_mode"], "headless")
-        self.assertIn("antigravity-ide", entry["profile"])
+        self.assertIn("antigravity-account-3", entry["profile"])
         self.assertIn(
             entry["display_status"],
             {"ONLINE", "IDLE", "WORKING", "FAILED", "OFFLINE"},
@@ -64,9 +64,12 @@ class TestMissionControlApi(unittest.TestCase):
         accounts = self._get("/api/agents")["antigravity"]["accounts"]
         p1 = accounts["antigravity-account-1"]["profile"]
         p2 = accounts["antigravity-account-2"]["profile"]
+        p3 = accounts["antigravity-account-3"]["profile"]
         self.assertNotEqual(p1, p2)
-        self.assertIn("antigravity-cli", p1)
-        self.assertIn("antigravity-ide", p2)
+        self.assertNotEqual(p2, p3)
+        self.assertIn("antigravity-account-jadhav", p1)
+        self.assertIn("antigravity-account-3", p2)
+        self.assertIn("antigravity-account-yash", p3)
 
     def test_status_endpoint_includes_agents_and_counters(self):
         data = self._get("/api/status")
@@ -101,6 +104,83 @@ class TestMissionControlApi(unittest.TestCase):
         blob = json.dumps(self._get("/api/status")).lower()
         for forbidden in ("api_key", "apikey", "bearer ", "authorization", "gemini_api_key", "password"):
             self.assertNotIn(forbidden, blob)
+
+    def test_overview_endpoint_contract(self):
+        data = self._get("/api/overview")
+        self.assertEqual(data["status"], "RUNNING")
+        self.assertIn("host", data)
+        self.assertEqual(data["host"]["max_concurrent_agents"], 2)
+        self.assertEqual(data["host"]["max_heavy_agents"], 1)
+        self.assertIn("task_counts", data)
+        for k in ("total", "running", "ready", "completed", "failed"):
+            self.assertIn(k, data["task_counts"])
+        self.assertIn("active_tasks", data)
+        self.assertIn("agents", data)
+        self.assertIn("token_metrics", data)
+
+    def test_single_task_lookup_endpoint(self):
+        tasks = self._get("/api/tasks")["tasks"]
+        if tasks:
+            tid = tasks[0]["task_id"]
+            res = self._get(f"/api/task?task_id={tid}")
+            self.assertIn("task", res)
+            self.assertEqual(res["task"]["task_id"], tid)
+            self.assertIn("stage", res["task"])
+
+    def test_route_simulation_endpoint(self):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/api/route",
+            data=json.dumps({"instruction": "Run tests on auth module"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            self.assertEqual(resp.status, 200)
+            data = json.loads(resp.read().decode("utf-8"))
+            self.assertIn("agent_id", data)
+            self.assertIn("candidates", data)
+            self.assertGreater(len(data["candidates"]), 1)
+
+    def test_memory_search_endpoint(self):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/api/memory/search",
+            data=json.dumps({"query": "authentication"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            self.assertEqual(resp.status, 200)
+            data = json.loads(resp.read().decode("utf-8"))
+            self.assertIn("count", data)
+            self.assertIn("memories", data)
+
+    def test_html_dashboard_and_javascript_syntax(self):
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/", timeout=10) as resp:
+            self.assertEqual(resp.status, 200)
+            html = resp.read().decode("utf-8")
+            self.assertIn("AGENTIC BRAIN", html)
+            self.assertIn("MISSION CONTROL", html)
+            self.assertIn('id="live-execution-widget"', html)
+            self.assertIn('id="tab-dashboard"', html)
+            self.assertIn('id="tab-agents"', html)
+            self.assertIn('id="tab-tasks"', html)
+            self.assertIn('id="tab-routing"', html)
+            self.assertIn('id="tab-tokens"', html)
+            self.assertIn('id="tab-worktrees"', html)
+            self.assertIn('id="tab-flow"', html)
+            self.assertIn('id="tab-memory"', html)
+            self.assertIn('id="tab-handoffs"', html)
+            self.assertIn('id="tab-events"', html)
+            self.assertIn('id="tab-git"', html)
+
+            # Ensure script block parses with zero syntax errors
+            script = html.split("<script>")[2].split("</script>")[0]
+            try:
+                import subprocess
+                proc = subprocess.run(["node", "-c"], input=script, text=True, capture_output=True)
+                self.assertEqual(proc.returncode, 0, f"Node syntax error: {proc.stderr}")
+            except FileNotFoundError:
+                pass
 
 
 if __name__ == "__main__":

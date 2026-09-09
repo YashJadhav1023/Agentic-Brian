@@ -55,22 +55,32 @@ class KiroAdapter(AgentAdapter):
         "claude-haiku-4.5",
     )
 
+    #: Single-account by design: isolated profile root not safely verified.
+    multi_account: bool = False
+    multi_account_reason: str = "isolated profile root not safely verified"
+
     def __init__(
         self,
         executable: str = "kiro-cli",
         capabilities: frozenset[Capability] | None = None,
         models: tuple[str, ...] | None = None,
         default_model: str = "auto",
+        agent_id: str = "kiro-cli",
+        account_id: str = "cli",
+        aws_profile: str | None = None,
     ) -> None:
         self._executable = executable
         self._capabilities = capabilities or self.DEFAULT_CAPABILITIES
         self._models = models or self.DEFAULT_MODELS
         self._default_model = default_model
+        self._agent_id = agent_id
+        self._account_id = account_id
+        self._aws_profile = aws_profile
         self._current_status = AgentStatus.IDLE
 
     @property
     def agent_id(self) -> str:
-        return "kiro-cli"
+        return self._agent_id
 
     @property
     def provider(self) -> str:
@@ -78,7 +88,7 @@ class KiroAdapter(AgentAdapter):
 
     @property
     def account_id(self) -> str:
-        return "cli"
+        return self._account_id
 
     @property
     def execution_mode(self) -> ExecutionMode:
@@ -97,7 +107,7 @@ class KiroAdapter(AgentAdapter):
         found = shutil.which(self._executable)
         if found:
             return found
-        candidate = Path(self._executable)
+        candidate = Path(self._executable).expanduser()
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return str(candidate)
         return None
@@ -138,24 +148,32 @@ class KiroAdapter(AgentAdapter):
 
         self._current_status = AgentStatus.WORKING
         start = time.time()
+        import datetime
+        started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         try:
+            sub_env = os.environ.copy()
+            if self._aws_profile:
+                sub_env["AWS_PROFILE"] = self._aws_profile
             proc = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
                 timeout=timeout_seconds,
                 cwd=str(work_dir or Path.cwd()),
-                env=os.environ.copy(),
+                env=sub_env,
             )
         except subprocess.TimeoutExpired:
             self._current_status = AgentStatus.FAILED
+            completed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
             return self._failure(
-                task_id, f"Task timed out after {timeout_seconds}s", model, 124, time.time() - start
+                task_id, f"Task timed out after {timeout_seconds}s", model, 124, time.time() - start, started_at, completed_at
             )
         except Exception as exc:
             self._current_status = AgentStatus.FAILED
-            return self._failure(task_id, str(exc), model, 1, time.time() - start)
+            completed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            return self._failure(task_id, str(exc), model, 1, time.time() - start, started_at, completed_at)
 
+        completed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         stdout = _ANSI_ESCAPE.sub("", proc.stdout).strip()
         stderr = _ANSI_ESCAPE.sub("", proc.stderr).strip()
         # Exit 0 with no answer is not a success; this CLI reports some errors
@@ -176,9 +194,15 @@ class KiroAdapter(AgentAdapter):
             output=stdout,
             error=error,
             requested_model=target_model,
-            # The CLI does not report which model served the request.
+            # The CLI does not report integer token counts or model id in text mode
             actual_model=UNKNOWN_MODEL,
             duration_seconds=time.time() - start,
+            input_tokens=None,
+            output_tokens=None,
+            total_tokens=None,
+            usage_source="unknown",
+            started_at=started_at,
+            completed_at=completed_at,
             raw_stdout=proc.stdout,
             raw_stderr=proc.stderr,
             command=[c for c in cmd[:-1]] + ["<prompt redacted>"],
@@ -191,6 +215,8 @@ class KiroAdapter(AgentAdapter):
         model: str | None,
         exit_code: int = 1,
         duration: float = 0.0,
+        started_at: str | None = None,
+        completed_at: str | None = None,
     ) -> TaskExecutionResult:
         return TaskExecutionResult(
             task_id=task_id,
@@ -204,6 +230,12 @@ class KiroAdapter(AgentAdapter):
             requested_model=model,
             actual_model=UNKNOWN_MODEL,
             duration_seconds=duration,
+            input_tokens=None,
+            output_tokens=None,
+            total_tokens=None,
+            usage_source="unknown",
+            started_at=started_at,
+            completed_at=completed_at,
         )
 
     def continue_session(
